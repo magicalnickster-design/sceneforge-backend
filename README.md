@@ -70,4 +70,6 @@ Optional generation/polling tuning:
 - Node version: `18+`
 
 The backend does **not** expose provider API keys to clients. Keep all secrets in deployment environment variables only.
+
+Note: Render environment variables are read from `process.env` directly. A missing `.env` file in production is expected.
 sceneforge-backend
