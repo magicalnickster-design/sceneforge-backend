@@ -211,6 +211,11 @@ function sleep(ms) {
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
+  const requestId =
+    response.headers.get("x-request-id") ||
+    response.headers.get("request-id") ||
+    response.headers.get("cf-ray") ||
+    null;
   let payload = null;
   try {
     payload = await response.json();
@@ -225,9 +230,99 @@ async function fetchJson(url, options = {}) {
     const error = new Error(message);
     error.status = response.status;
     error.details = payload;
+    error.requestId = requestId;
+    error.endpoint = url;
     throw error;
   }
+  if (payload && typeof payload === "object" && requestId && !payload.requestId) {
+    payload.requestId = requestId;
+  }
   return payload;
+}
+
+function redactSensitive(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitive(item));
+  }
+  if (value && typeof value === "object") {
+    const next = {};
+    for (const [key, nested] of Object.entries(value)) {
+      if (/(token|secret|authorization|api[_-]?key|password|credential)/i.test(key)) {
+        next[key] = "[REDACTED]";
+      } else {
+        next[key] = redactSensitive(nested);
+      }
+    }
+    return next;
+  }
+  return value;
+}
+
+function extractGenerationId(payload) {
+  return payload?.id || payload?.result?.id || null;
+}
+
+function createGenerationError(reason, detail, meta = {}) {
+  const error = new Error(detail);
+  error.reason = reason;
+  error.detail = detail;
+  if (typeof meta.status === "number") {
+    error.status = meta.status;
+  }
+  if (typeof meta.upstreamStatus === "number") {
+    error.upstreamStatus = meta.upstreamStatus;
+  }
+  if (meta.endpoint) {
+    error.endpoint = meta.endpoint;
+  }
+  if (meta.generationId) {
+    error.generationId = meta.generationId;
+  }
+  if (meta.requestId) {
+    error.requestId = meta.requestId;
+  }
+  if (meta.upstream) {
+    error.upstream = redactSensitive(meta.upstream);
+  }
+  return error;
+}
+
+function classifyGenerationReason(error) {
+  const detail = String(error?.detail || error?.message || "").toLowerCase();
+  if (detail.includes("credit") || detail.includes("insufficient")) {
+    return "insufficient_credits";
+  }
+  if (detail.includes("timeout")) {
+    return "provider_timeout";
+  }
+  if (detail.includes("prompt")) {
+    return "invalid_prompt";
+  }
+  const upstreamStatus = Number(error?.upstreamStatus || error?.status);
+  if (upstreamStatus >= 400) {
+    return `upstream_${upstreamStatus}`;
+  }
+  return "provider_error";
+}
+
+function buildGenerationFailure(error) {
+  const upstreamStatus = Number(error?.upstreamStatus || error?.status) || null;
+  const detail = error?.detail || error?.message || "Failed to generate map image.";
+  return {
+    statusCode: upstreamStatus && upstreamStatus >= 400 ? upstreamStatus : 500,
+    payload: {
+      error: "generation_failed",
+      reason: error?.reason || classifyGenerationReason(error),
+      detail,
+      provider: PROVIDER_NAME,
+      model: MODEL_NAME,
+      endpoint: BFL_GENERATE_ENDPOINT,
+      upstreamStatus,
+      generationId: error?.generationId || null,
+      requestId: error?.requestId || null,
+      upstream: redactSensitive(error?.upstream || error?.details || null)
+    }
+  };
 }
 
 function selectImageUrl(resultPayload) {
@@ -253,7 +348,7 @@ function selectImageUrl(resultPayload) {
   return candidates.find((candidate) => typeof candidate === "string" && candidate.length > 0) || null;
 }
 
-async function pollBflResult(initialPayload) {
+async function pollBflResult(initialPayload, generationId = null) {
   if (initialPayload && selectImageUrl(initialPayload)) {
     return initialPayload;
   }
@@ -264,21 +359,62 @@ async function pollBflResult(initialPayload) {
     (initialPayload?.id ? `${BFL_RESULT_ENDPOINT}?id=${encodeURIComponent(initialPayload.id)}` : null);
 
   if (!pollingUrl) {
-    throw new Error("BFL response did not include polling_url or id.");
+    throw createGenerationError(
+      "provider_response_invalid",
+      "BFL response did not include polling_url or id.",
+      {
+        generationId,
+        endpoint: BFL_GENERATE_ENDPOINT,
+        upstream: initialPayload
+      }
+    );
   }
 
+  let lastStatus = "";
+  let lastPayload = null;
   for (let attempt = 1; attempt <= MAX_BFL_POLL_ATTEMPTS; attempt += 1) {
-    const resultPayload = await fetchJson(pollingUrl, {
-      method: "GET",
-      headers: {
-        "x-key": BFL_API_KEY,
-        Authorization: `Bearer ${BFL_API_KEY}`
-      }
-    });
+    let resultPayload;
+    try {
+      resultPayload = await fetchJson(pollingUrl, {
+        method: "GET",
+        headers: {
+          "x-key": BFL_API_KEY,
+          Authorization: `Bearer ${BFL_API_KEY}`
+        }
+      });
+    } catch (error) {
+      throw createGenerationError(
+        classifyGenerationReason(error),
+        error.message || "Polling request failed at provider.",
+        {
+          status: Number(error.status) || undefined,
+          upstreamStatus: Number(error.status) || undefined,
+          generationId,
+          endpoint: pollingUrl,
+          requestId: error?.requestId,
+          upstream: error?.details
+        }
+      );
+    }
+    lastPayload = resultPayload;
 
     const status = String(resultPayload?.status || resultPayload?.result?.status || "").toLowerCase();
+    lastStatus = status;
     if (status === "failed" || resultPayload?.error) {
-      throw new Error(resultPayload?.error || "BFL reported generation failure.");
+      throw createGenerationError(
+        classifyGenerationReason({
+          status: 422,
+          detail: resultPayload?.error || "BFL reported generation failure."
+        }),
+        resultPayload?.error || "BFL reported generation failure.",
+        {
+          status: 422,
+          upstreamStatus: 422,
+          generationId,
+          endpoint: pollingUrl,
+          upstream: resultPayload
+        }
+      );
     }
 
     if (selectImageUrl(resultPayload)) {
@@ -292,7 +428,20 @@ async function pollBflResult(initialPayload) {
     await sleep(BFL_POLL_INTERVAL_MS);
   }
 
-  throw new Error("Timed out while polling BFL generation result.");
+  throw createGenerationError(
+    "provider_timeout",
+    `Timed out while polling BFL generation result after ${MAX_BFL_POLL_ATTEMPTS} attempts.`,
+    {
+      status: 504,
+      upstreamStatus: 504,
+      generationId,
+      endpoint: pollingUrl,
+      upstream: {
+        lastStatus,
+        lastPayload
+      }
+    }
+  );
 }
 
 app.get("/health", (_req, res) => {
@@ -472,12 +621,19 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       },
       body: JSON.stringify(payload)
     });
+    const generationId = extractGenerationId(initialResponse);
 
-    const result = await pollBflResult(initialResponse);
+    const result = await pollBflResult(initialResponse, generationId);
     const imageUrl = selectImageUrl(result);
 
     if (!imageUrl) {
-      throw new Error("No image URL returned by BFL.");
+      throw createGenerationError("provider_response_invalid", "No image URL returned by BFL.", {
+        status: 502,
+        upstreamStatus: 502,
+        generationId: extractGenerationId(result) || generationId,
+        endpoint: BFL_RESULT_ENDPOINT,
+        upstream: result
+      });
     }
 
     const usage = getOrCreateTokenUsage(getUsageKey(req.auth));
@@ -501,12 +657,7 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       await tokenStore.touchLastUsedById(req.auth.recordId);
     }
 
-    const generationId =
-      result?.id ||
-      result?.result?.id ||
-      initialResponse?.id ||
-      initialResponse?.result?.id ||
-      null;
+    const finalGenerationId = extractGenerationId(result) || generationId;
 
     return res.json({
       imagePath: imageUrl,
@@ -517,7 +668,7 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       endpoint: BFL_GENERATE_ENDPOINT,
       estimatedCost:
         Number(result?.cost ?? result?.result?.cost ?? imageCount * ESTIMATED_COST_PER_IMAGE) || 0,
-      generationId,
+      generationId: finalGenerationId,
       imageCount,
       metadata: {
         provider: PROVIDER_NAME,
@@ -525,17 +676,23 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
         endpoint: BFL_GENERATE_ENDPOINT,
         estimatedCost:
           Number(result?.cost ?? result?.result?.cost ?? imageCount * ESTIMATED_COST_PER_IMAGE) || 0,
-        generationId,
+        generationId: finalGenerationId,
         imageCount
       }
     });
   } catch (error) {
-    const statusCode = Number(error.status) || 500;
-    return res.status(statusCode).json({
-      error: "generation_failed",
-      message: error.message || "Failed to generate map image.",
-      details: error.details || null
-    });
+    const failure = buildGenerationFailure(error);
+    console.error(
+      JSON.stringify({
+        event: "maps_generate_failed",
+        endpoint: failure.payload.endpoint,
+        upstreamStatus: failure.payload.upstreamStatus,
+        reason: failure.payload.reason,
+        detail: failure.payload.detail,
+        generationId: failure.payload.generationId
+      })
+    );
+    return res.status(failure.statusCode).json(failure.payload);
   }
 });
 

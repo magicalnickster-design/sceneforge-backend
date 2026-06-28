@@ -8,6 +8,7 @@
     "dev": "node --watch src/server.js",
     "check": "node --check src/server.js",
     "init-storage": "node scripts/init-storage.js",
+    "validate:generate": "node scripts/validate-generate.js",
     "test": "node --test"
   },
   "engines": {
