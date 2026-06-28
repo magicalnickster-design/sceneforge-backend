@@ -1,22 +1,22 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const path = require("path");
+const { TokenStore } = require("./lib/tokenStore");
+const { verifyDiscordRole } = require("./lib/discordEntitlement");
+const {
+  parseStaticTokens,
+  createBotSecretMiddleware,
+  createSubscriptionAuthorizer
+} = require("./lib/auth");
 
 dotenv.config({ quiet: true });
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
 
 const PORT = Number(process.env.PORT || 3000);
 const BFL_API_KEY = process.env.BFL_API_KEY || "";
 const OWNER_ACCESS_TOKEN = process.env.OWNER_ACCESS_TOKEN || "";
-const SUBSCRIPTION_TOKENS = new Set(
-  (process.env.SUBSCRIPTION_TOKENS || "")
-    .split(",")
-    .map((token) => token.trim())
-    .filter(Boolean)
-);
+const BOT_SHARED_SECRET = process.env.BOT_SHARED_SECRET || "";
+const SUBSCRIPTION_TOKENS = parseStaticTokens(process.env.SUBSCRIPTION_TOKENS || "");
 const DEFAULT_IMAGE_COUNT = Math.max(
   1,
   Number(process.env.DEFAULT_IMAGE_COUNT || 1)
@@ -30,6 +30,9 @@ const BFL_POLL_INTERVAL_MS = Math.max(
   Number(process.env.BFL_POLL_INTERVAL_MS || 2000)
 );
 const ESTIMATED_COST_PER_IMAGE = Number(process.env.ESTIMATED_COST_PER_IMAGE || 0);
+const TOKEN_SIGNING_PEPPER = process.env.TOKEN_SIGNING_PEPPER || "";
+const DB_PATH =
+  process.env.DB_PATH || path.join(process.cwd(), "data", "tokens.json");
 
 const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
@@ -38,6 +41,21 @@ const MODEL_NAME = "flux-2-flex";
 
 const mapLibrary = new Map();
 const monthlyUsageCounters = {};
+const tokenStore = new TokenStore({
+  dbPath: DB_PATH,
+  tokenPepper: TOKEN_SIGNING_PEPPER
+});
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+const requireBotSecret = createBotSecretMiddleware(BOT_SHARED_SECRET);
+const authorizeSubscriptionToken = createSubscriptionAuthorizer({
+  ownerAccessToken: OWNER_ACCESS_TOKEN,
+  staticSubscriptionTokens: SUBSCRIPTION_TOKENS,
+  tokenStore
+});
 
 function monthKey(date = new Date()) {
   const year = date.getUTCFullYear();
@@ -58,42 +76,6 @@ function getOrCreateTokenUsage(token) {
     };
   }
   return monthlyUsageCounters[currentMonth][token];
-}
-
-function parseBearerToken(req) {
-  const authHeader = req.headers.authorization || "";
-  const [scheme, token] = authHeader.split(" ");
-  if (scheme !== "Bearer" || !token) {
-    return null;
-  }
-  return token.trim();
-}
-
-function authorizeSubscriptionToken(req, res, next) {
-  const token = parseBearerToken(req);
-  if (!token) {
-    return res.status(401).json({
-      error: "missing_bearer_token",
-      message: "Bearer token is required."
-    });
-  }
-
-  const isOwner = OWNER_ACCESS_TOKEN && token === OWNER_ACCESS_TOKEN;
-  const isSubscriber = SUBSCRIPTION_TOKENS.has(token);
-
-  if (!isOwner && !isSubscriber) {
-    return res.status(403).json({
-      error: "invalid_subscription_token",
-      message: "Provided token is not active."
-    });
-  }
-
-  req.auth = {
-    token,
-    isOwner,
-    unlimited: Boolean(isOwner)
-  };
-  return next();
 }
 
 function sleep(ms) {
@@ -194,6 +176,120 @@ app.get("/health", (_req, res) => {
   });
 });
 
+app.post("/api/tokens/issue-or-get", requireBotSecret, async (req, res) => {
+  const discordUserId = String(req.body?.discordUserId || "").trim();
+  const rotate = Boolean(req.body?.rotate);
+  const reason = String(req.body?.reason || "").trim();
+
+  if (!discordUserId) {
+    return res.status(400).json({
+      error: "invalid_discord_user_id",
+      message: "Field 'discordUserId' is required."
+    });
+  }
+
+  try {
+    const entitlement = await verifyDiscordRole({ discordUserId });
+    if (!entitlement.ok) {
+      return res.status(entitlement.statusCode).json({
+        error: entitlement.error,
+        message: entitlement.message
+      });
+    }
+
+    const issued = await tokenStore.issueOrGetToken({
+      discordUserId,
+      rotate,
+      source: "discord-bot",
+      notes: reason
+    });
+
+    return res.json({
+      ok: true,
+      discordUserId,
+      token: issued.token,
+      reused: issued.reused,
+      status: issued.record.status,
+      issuedAt: issued.record.issuedAt
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "token_issue_failed",
+      message: error.message || "Failed to issue token."
+    });
+  }
+});
+
+app.post("/api/tokens/revoke", requireBotSecret, async (req, res) => {
+  const discordUserId = String(req.body?.discordUserId || "").trim();
+  const reason = String(req.body?.reason || "").trim();
+  if (!discordUserId) {
+    return res.status(400).json({
+      error: "invalid_discord_user_id",
+      message: "Field 'discordUserId' is required."
+    });
+  }
+  try {
+    const result = await tokenStore.revokeActiveTokenForUser(discordUserId, reason);
+    return res.json({
+      ok: true,
+      revoked: result.revoked,
+      discordUserId
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "token_revoke_failed",
+      message: error.message || "Failed to revoke token."
+    });
+  }
+});
+
+app.get("/api/tokens/status/:discordUserId", requireBotSecret, async (req, res) => {
+  const discordUserId = String(req.params?.discordUserId || "").trim();
+  if (!discordUserId) {
+    return res.status(400).json({
+      error: "invalid_discord_user_id",
+      message: "discordUserId path param is required."
+    });
+  }
+  try {
+    const status = await tokenStore.getStatusForUser(discordUserId);
+    return res.json({
+      ok: true,
+      discordUserId,
+      ...status
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "token_status_failed",
+      message: error.message || "Failed to fetch token status."
+    });
+  }
+});
+
+app.post("/api/tokens/validate", requireBotSecret, async (req, res) => {
+  const token = String(req.body?.token || "").trim();
+  if (!token) {
+    return res.status(400).json({
+      error: "invalid_token",
+      message: "Field 'token' is required."
+    });
+  }
+  try {
+    const record = await tokenStore.validateToken(token);
+    return res.json({
+      valid: Boolean(record),
+      discordUserId: record?.discordUserId || null,
+      status: record?.status || "none"
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "token_validate_failed",
+      message: error.message || "Failed to validate token."
+    });
+  }
+});
+
 app.get("/api/subscription/status", authorizeSubscriptionToken, (req, res) => {
   const usage = getOrCreateTokenUsage(req.auth.token);
   res.json({
@@ -261,6 +357,9 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
     usage.generations += 1;
     usage.generatedImages += imageCount;
     usage.lastUsedAt = new Date().toISOString();
+    if (req.auth.recordId) {
+      await tokenStore.touchLastUsedById(req.auth.recordId);
+    }
 
     const generationId =
       result?.id ||
@@ -449,6 +548,14 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`SceneForge backend listening on port ${PORT}`);
+async function start() {
+  await tokenStore.init();
+  app.listen(PORT, () => {
+    console.log(`SceneForge backend listening on port ${PORT}`);
+  });
+}
+
+start().catch((error) => {
+  console.error("Failed to initialize server:", error.message);
+  process.exit(1);
 });
