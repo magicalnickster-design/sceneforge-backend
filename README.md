@@ -1,16 +1,16 @@
 # SceneForge Backend
 
-SceneForge backend for subscription-gated map generation with BFL FLUX.2 Flex plus Discord-role key issuance for Patreon communities.
+SceneForge backend for subscription-gated map generation with BFL FLUX.2 Flex and Discord OAuth linking.
 
 ## Architecture (text diagram)
 
-1. Patreon subscriber receives Discord role in your server
-2. User runs `/getkey` in Discord
-3. Discord bot calls backend `/api/tokens/issue-or-get` with `X-Bot-Secret`
-4. Backend verifies user membership + required role via Discord API
-5. Backend issues per-user token (stored as hash only) and returns plaintext once
-6. Bot DMs key to user
-7. Foundry module calls `/api/maps/generate` with `Authorization: Bearer <token>`
+1. User clicks "Link Discord" in module
+2. Module opens backend `/api/auth/discord/connect?returnUrl=...`
+3. User authorizes Discord account
+4. Backend callback checks guild membership + tier role (`Tier 1`, `Tier 2`, `Founder`)
+5. Backend issues a 30-day per-user token (stored as hash only)
+6. Module receives token in callback URL fragment and saves it
+7. Module calls `/api/maps/generate` with `Authorization: Bearer <token>`
 
 ## API Endpoints
 
@@ -19,18 +19,12 @@ SceneForge backend for subscription-gated map generation with BFL FLUX.2 Flex pl
 - `GET /health`
 - `GET /api/subscription/status` (Bearer token required)
 - `POST /api/maps/generate` (Bearer token required)
-- `GET /api/auth/patreon/connect?returnUrl=<url>`
+- `GET /api/auth/discord/connect?returnUrl=<url>`
+- `GET /api/auth/discord/callback`
 - `POST /api/maps/reuse/exact`
 - `POST /api/maps/library/upsert`
 - `POST /api/maps/library/mark-used`
 - `POST /api/maps/library/vote`
-
-### Bot/admin endpoints (`X-Bot-Secret` required)
-
-- `POST /api/tokens/issue-or-get`
-- `POST /api/tokens/revoke`
-- `GET /api/tokens/status/:discordUserId`
-- `POST /api/tokens/validate`
 
 ## Quick Start
 
@@ -46,10 +40,14 @@ npm run dev
 Required:
 
 - `BFL_API_KEY`
-- `BOT_SHARED_SECRET`
 - `DISCORD_BOT_TOKEN`
+- `DISCORD_CLIENT_ID`
+- `DISCORD_CLIENT_SECRET`
 - `DISCORD_GUILD_ID`
-- `DISCORD_REQUIRED_ROLE_ID`
+- `DISCORD_REDIRECT_URI`
+- `DISCORD_ROLE_PATREON_TIER1_ID`
+- `DISCORD_ROLE_PATREON_TIER2_ID`
+- `DISCORD_ROLE_PATREON_FOUNDER_ID`
 - `TOKEN_SIGNING_PEPPER`
 
 Recommended:
@@ -57,13 +55,11 @@ Recommended:
 - `OWNER_ACCESS_TOKEN` (owner unlimited mode)
 - `SUBSCRIPTION_TOKENS` (legacy fallback/manual tokens)
 - `DB_PATH` (default: `./data/tokens.json`)
+- `TOKEN_TTL_DAYS` (default: 30)
+- `MONTHLY_GENERATION_LIMIT_TIER1`
+- `MONTHLY_GENERATION_LIMIT_TIER2`
+- `MONTHLY_GENERATION_LIMIT_FOUNDER`
 - `PORT` (default: `3000`)
-
-Optional Patreon connect values:
-
-- `PATREON_CLIENT_ID`
-- `PATREON_REDIRECT_URI`
-- `PATREON_SCOPE` (default: `identity identity.memberships campaigns`)
 
 Optional generation tuning:
 
@@ -75,26 +71,23 @@ Optional generation tuning:
 ## Security Notes
 
 - BFL keys stay server-side in env vars only.
-- Bot admin routes use constant-time shared-secret checks.
 - Issued tokens are stored as hashes; plaintext is returned only when newly issued.
-- Existing static `SUBSCRIPTION_TOKENS` remain supported for migration.
+- Existing static `SUBSCRIPTION_TOKENS` remain supported for migration/fallback.
+- OAuth state is signed with `DISCORD_OAUTH_STATE_SECRET` (or fallback secret).
 
 ## Curl Examples
 
-Issue or get token:
+Get Discord connect URL:
 
 ```bash
-curl -X POST "http://localhost:3000/api/tokens/issue-or-get" \
-  -H "Content-Type: application/json" \
-  -H "X-Bot-Secret: BOT_SECRET" \
-  -d '{"discordUserId":"123456789012345678","rotate":false}'
+curl "http://localhost:3000/api/auth/discord/connect?returnUrl=http://localhost:30000"
 ```
 
-Check token status:
+Check subscription status:
 
 ```bash
-curl "http://localhost:3000/api/tokens/status/123456789012345678" \
-  -H "X-Bot-Secret: BOT_SECRET"
+curl "http://localhost:3000/api/subscription/status" \
+  -H "Authorization: Bearer USER_TOKEN"
 ```
 
 Generate map:
@@ -105,10 +98,6 @@ curl -X POST "http://localhost:3000/api/maps/generate" \
   -H "Content-Type: application/json" \
   -d '{"prompt":"top-down tavern battle map","imageCount":1}'
 ```
-
-## Discord Bot Starter
-
-See [`bot/README.md`](bot/README.md) for `/getkey` and `/rotatekey` starter setup.
 
 ## Deploy (Render / Railway)
 

@@ -2,34 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   parseStaticTokens,
-  createBotSecretMiddleware,
   createSubscriptionAuthorizer
 } = require("../src/lib/auth");
-
-test("bot secret middleware rejects invalid secrets", async () => {
-  const middleware = createBotSecretMiddleware("shared-secret");
-  const req = { headers: { "x-bot-secret": "wrong" } };
-  const result = { statusCode: 200, body: null };
-  const res = {
-    status(code) {
-      result.statusCode = code;
-      return this;
-    },
-    json(payload) {
-      result.body = payload;
-      return this;
-    }
-  };
-
-  let nextCalled = false;
-  middleware(req, res, () => {
-    nextCalled = true;
-  });
-
-  assert.equal(nextCalled, false);
-  assert.equal(result.statusCode, 401);
-  assert.equal(result.body.error, "unauthorized_bot");
-});
 
 test("subscription authorizer supports static fallback tokens", async () => {
   const middleware = createSubscriptionAuthorizer({
@@ -66,4 +40,52 @@ test("subscription authorizer supports static fallback tokens", async () => {
 
   assert.equal(nextCalled, true);
   assert.equal(req.auth.source, "static");
+});
+
+test("subscription authorizer accepts managed token records", async () => {
+  const middleware = createSubscriptionAuthorizer({
+    ownerAccessToken: "owner",
+    staticSubscriptionTokens: parseStaticTokens(""),
+    tokenStore: {
+      async validateToken(token) {
+        if (token !== "managed") {
+          return null;
+        }
+        return {
+          id: "rec-1",
+          discordUserId: "12345",
+          tier: "tier2",
+          monthlyGenerationLimit: 600,
+          expiresAt: "2099-01-01T00:00:00.000Z"
+        };
+      }
+    }
+  });
+
+  const req = {
+    headers: {
+      authorization: "Bearer managed"
+    }
+  };
+  const result = { statusCode: 200, body: null };
+  const res = {
+    status(code) {
+      result.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      result.body = payload;
+      return this;
+    }
+  };
+
+  let nextCalled = false;
+  await middleware(req, res, () => {
+    nextCalled = true;
+  });
+
+  assert.equal(nextCalled, true);
+  assert.equal(req.auth.source, "managed-token");
+  assert.equal(req.auth.discordUserId, "12345");
+  assert.equal(req.auth.monthlyGenerationLimit, 600);
 });

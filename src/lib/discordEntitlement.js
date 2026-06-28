@@ -1,12 +1,8 @@
 function missingDiscordConfig(env) {
-  return (
-    !env.DISCORD_BOT_TOKEN ||
-    !env.DISCORD_GUILD_ID ||
-    !env.DISCORD_REQUIRED_ROLE_ID
-  );
+  return !env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID;
 }
 
-async function verifyDiscordRole({
+async function fetchGuildMember({
   discordUserId,
   env = process.env,
   fetchImpl = fetch
@@ -16,8 +12,7 @@ async function verifyDiscordRole({
       ok: false,
       statusCode: 503,
       error: "discord_not_configured",
-      message:
-        "DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, and DISCORD_REQUIRED_ROLE_ID are required."
+      message: "DISCORD_BOT_TOKEN and DISCORD_GUILD_ID are required."
     };
   }
 
@@ -62,20 +57,13 @@ async function verifyDiscordRole({
 
   const member = await response.json();
   const roles = Array.isArray(member.roles) ? member.roles : [];
-  if (!roles.includes(env.DISCORD_REQUIRED_ROLE_ID)) {
-    return {
-      ok: false,
-      statusCode: 403,
-      error: "not_entitled",
-      message: "User does not have the required Discord role."
-    };
-  }
-
   return {
-    ok: true
+    ok: true,
+    member,
+    roles
   };
 }
 
 module.exports = {
-  verifyDiscordRole
+  fetchGuildMember
 };

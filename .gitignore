@@ -1,7 +1,5 @@
 node_modules/
-bot/node_modules/
 .env
-bot/.env
 data/*.json
 npm-debug.log*
 yarn-debug.log*

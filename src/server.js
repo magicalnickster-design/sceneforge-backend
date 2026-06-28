@@ -2,20 +2,16 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
+const crypto = require("crypto");
 const { TokenStore } = require("./lib/tokenStore");
-const { verifyDiscordRole } = require("./lib/discordEntitlement");
-const {
-  parseStaticTokens,
-  createBotSecretMiddleware,
-  createSubscriptionAuthorizer
-} = require("./lib/auth");
+const { fetchGuildMember } = require("./lib/discordEntitlement");
+const { parseStaticTokens, createSubscriptionAuthorizer } = require("./lib/auth");
 
 dotenv.config({ quiet: true });
 
 const PORT = Number(process.env.PORT || 3000);
 const BFL_API_KEY = process.env.BFL_API_KEY || "";
 const OWNER_ACCESS_TOKEN = process.env.OWNER_ACCESS_TOKEN || "";
-const BOT_SHARED_SECRET = process.env.BOT_SHARED_SECRET || "";
 const SUBSCRIPTION_TOKENS = parseStaticTokens(process.env.SUBSCRIPTION_TOKENS || "");
 const DEFAULT_IMAGE_COUNT = Math.max(
   1,
@@ -33,6 +29,31 @@ const ESTIMATED_COST_PER_IMAGE = Number(process.env.ESTIMATED_COST_PER_IMAGE || 
 const TOKEN_SIGNING_PEPPER = process.env.TOKEN_SIGNING_PEPPER || "";
 const DB_PATH =
   process.env.DB_PATH || path.join(process.cwd(), "data", "tokens.json");
+const TOKEN_TTL_DAYS = Math.max(1, Number(process.env.TOKEN_TTL_DAYS || 30));
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const DISCORD_REDIRECT_URI = process.env.DISCORD_REDIRECT_URI || "";
+const DISCORD_OAUTH_STATE_SECRET =
+  process.env.DISCORD_OAUTH_STATE_SECRET ||
+  TOKEN_SIGNING_PEPPER ||
+  OWNER_ACCESS_TOKEN ||
+  "sceneforge-state";
+const DISCORD_ROLE_PATREON_TIER1_ID = process.env.DISCORD_ROLE_PATREON_TIER1_ID || "";
+const DISCORD_ROLE_PATREON_TIER2_ID = process.env.DISCORD_ROLE_PATREON_TIER2_ID || "";
+const DISCORD_ROLE_PATREON_FOUNDER_ID =
+  process.env.DISCORD_ROLE_PATREON_FOUNDER_ID || "";
+const MONTHLY_GENERATION_LIMIT_TIER1 = Math.max(
+  1,
+  Number(process.env.MONTHLY_GENERATION_LIMIT_TIER1 || 200)
+);
+const MONTHLY_GENERATION_LIMIT_TIER2 = Math.max(
+  1,
+  Number(process.env.MONTHLY_GENERATION_LIMIT_TIER2 || 600)
+);
+const MONTHLY_GENERATION_LIMIT_FOUNDER = Math.max(
+  1,
+  Number(process.env.MONTHLY_GENERATION_LIMIT_FOUNDER || 2000)
+);
 
 const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
@@ -50,7 +71,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const requireBotSecret = createBotSecretMiddleware(BOT_SHARED_SECRET);
 const authorizeSubscriptionToken = createSubscriptionAuthorizer({
   ownerAccessToken: OWNER_ACCESS_TOKEN,
   staticSubscriptionTokens: SUBSCRIPTION_TOKENS,
@@ -63,19 +83,126 @@ function monthKey(date = new Date()) {
   return `${year}-${month}`;
 }
 
-function getOrCreateTokenUsage(token) {
+function getOrCreateTokenUsage(usageKey) {
   const currentMonth = monthKey();
   if (!monthlyUsageCounters[currentMonth]) {
     monthlyUsageCounters[currentMonth] = {};
   }
-  if (!monthlyUsageCounters[currentMonth][token]) {
-    monthlyUsageCounters[currentMonth][token] = {
+  if (!monthlyUsageCounters[currentMonth][usageKey]) {
+    monthlyUsageCounters[currentMonth][usageKey] = {
       generatedImages: 0,
       generations: 0,
       lastUsedAt: null
     };
   }
-  return monthlyUsageCounters[currentMonth][token];
+  return monthlyUsageCounters[currentMonth][usageKey];
+}
+
+function getUsageKey(auth) {
+  return auth.discordUserId || auth.token;
+}
+
+function getTierFromRoles(roles = []) {
+  if (DISCORD_ROLE_PATREON_FOUNDER_ID && roles.includes(DISCORD_ROLE_PATREON_FOUNDER_ID)) {
+    return {
+      tier: "founder",
+      monthlyGenerationLimit: MONTHLY_GENERATION_LIMIT_FOUNDER
+    };
+  }
+  if (DISCORD_ROLE_PATREON_TIER2_ID && roles.includes(DISCORD_ROLE_PATREON_TIER2_ID)) {
+    return {
+      tier: "tier2",
+      monthlyGenerationLimit: MONTHLY_GENERATION_LIMIT_TIER2
+    };
+  }
+  if (DISCORD_ROLE_PATREON_TIER1_ID && roles.includes(DISCORD_ROLE_PATREON_TIER1_ID)) {
+    return {
+      tier: "tier1",
+      monthlyGenerationLimit: MONTHLY_GENERATION_LIMIT_TIER1
+    };
+  }
+  return null;
+}
+
+function encodeState(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", DISCORD_OAUTH_STATE_SECRET)
+    .update(body)
+    .digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function decodeState(state) {
+  const [body, signature] = String(state || "").split(".");
+  if (!body || !signature) {
+    return null;
+  }
+  const expected = crypto
+    .createHmac("sha256", DISCORD_OAUTH_STATE_SECRET)
+    .update(body)
+    .digest("base64url");
+  if (expected !== signature) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function buildRedirectUrl(returnUrl, params) {
+  try {
+    const url = new URL(returnUrl);
+    const hashParams = new URLSearchParams(params);
+    url.hash = hashParams.toString();
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function exchangeDiscordCodeForUser(code) {
+  if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET || !DISCORD_REDIRECT_URI) {
+    const error = new Error(
+      "DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, and DISCORD_REDIRECT_URI are required."
+    );
+    error.status = 503;
+    throw error;
+  }
+
+  const tokenBody = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    client_secret: DISCORD_CLIENT_SECRET,
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: DISCORD_REDIRECT_URI
+  });
+  const tokenResponse = await fetchJson("https://discord.com/api/v10/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: tokenBody.toString()
+  });
+
+  const accessToken = tokenResponse?.access_token;
+  if (!accessToken) {
+    const error = new Error("Discord OAuth token response did not include access_token.");
+    error.status = 502;
+    throw error;
+  }
+
+  const user = await fetchJson("https://discord.com/api/v10/users/@me", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+
+  return user;
 }
 
 function sleep(ms) {
@@ -176,128 +303,128 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.post("/api/tokens/issue-or-get", requireBotSecret, async (req, res) => {
-  const discordUserId = String(req.body?.discordUserId || "").trim();
-  const rotate = Boolean(req.body?.rotate);
-  const reason = String(req.body?.reason || "").trim();
-
-  if (!discordUserId) {
-    return res.status(400).json({
-      error: "invalid_discord_user_id",
-      message: "Field 'discordUserId' is required."
+app.get("/api/auth/discord/connect", (req, res) => {
+  const returnUrl = String(req.query.returnUrl || "").trim();
+  if (!DISCORD_CLIENT_ID || !DISCORD_REDIRECT_URI) {
+    return res.status(503).json({
+      error: "discord_oauth_not_configured",
+      message: "DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI are required."
     });
+  }
+  const state = encodeState({
+    returnUrl,
+    ts: Date.now(),
+    nonce: crypto.randomBytes(12).toString("hex")
+  });
+  const connectUrl = new URL("https://discord.com/api/oauth2/authorize");
+  connectUrl.searchParams.set("client_id", DISCORD_CLIENT_ID);
+  connectUrl.searchParams.set("response_type", "code");
+  connectUrl.searchParams.set("redirect_uri", DISCORD_REDIRECT_URI);
+  connectUrl.searchParams.set("scope", "identify");
+  connectUrl.searchParams.set("state", state);
+  res.json({
+    connectUrl: connectUrl.toString(),
+    returnUrl
+  });
+});
+
+app.get("/api/auth/discord/callback", async (req, res) => {
+  const code = String(req.query.code || "").trim();
+  const state = decodeState(String(req.query.state || ""));
+  const returnUrl = state?.returnUrl || "";
+  const fail = (error, message, statusCode = 400) => {
+    const redirect = returnUrl
+      ? buildRedirectUrl(returnUrl, { linked: "false", error, message })
+      : null;
+    if (redirect) {
+      return res.redirect(302, redirect);
+    }
+    return res.status(statusCode).json({ error, message });
+  };
+
+  if (!state) {
+    return fail("invalid_state", "OAuth state was invalid or expired.");
+  }
+  if (!code) {
+    return fail("missing_code", "Discord callback did not include code.");
   }
 
   try {
-    const entitlement = await verifyDiscordRole({ discordUserId });
-    if (!entitlement.ok) {
-      return res.status(entitlement.statusCode).json({
-        error: entitlement.error,
-        message: entitlement.message
-      });
+    const user = await exchangeDiscordCodeForUser(code);
+    const discordUserId = String(user?.id || "").trim();
+    if (!discordUserId) {
+      return fail("discord_identity_failed", "Unable to read Discord user identity.", 502);
+    }
+
+    const membership = await fetchGuildMember({ discordUserId });
+    if (!membership.ok) {
+      return fail(membership.error, membership.message, membership.statusCode);
+    }
+
+    const tierConfig = getTierFromRoles(membership.roles);
+    if (!tierConfig) {
+      return fail(
+        "not_entitled",
+        "No entitled Discord tier role found (Patreon Tier 1/2/Founder).",
+        403
+      );
     }
 
     const issued = await tokenStore.issueOrGetToken({
       discordUserId,
-      rotate,
-      source: "discord-bot",
-      notes: reason
+      rotate: true,
+      source: "discord-oauth",
+      notes: "module_discord_link",
+      tier: tierConfig.tier,
+      monthlyGenerationLimit: tierConfig.monthlyGenerationLimit,
+      ttlDays: TOKEN_TTL_DAYS
     });
 
-    return res.json({
-      ok: true,
-      discordUserId,
+    const payload = {
+      linked: "true",
       token: issued.token,
-      reused: issued.reused,
-      status: issued.record.status,
-      issuedAt: issued.record.issuedAt
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: "token_issue_failed",
-      message: error.message || "Failed to issue token."
-    });
-  }
-});
-
-app.post("/api/tokens/revoke", requireBotSecret, async (req, res) => {
-  const discordUserId = String(req.body?.discordUserId || "").trim();
-  const reason = String(req.body?.reason || "").trim();
-  if (!discordUserId) {
-    return res.status(400).json({
-      error: "invalid_discord_user_id",
-      message: "Field 'discordUserId' is required."
-    });
-  }
-  try {
-    const result = await tokenStore.revokeActiveTokenForUser(discordUserId, reason);
-    return res.json({
-      ok: true,
-      revoked: result.revoked,
-      discordUserId
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: "token_revoke_failed",
-      message: error.message || "Failed to revoke token."
-    });
-  }
-});
-
-app.get("/api/tokens/status/:discordUserId", requireBotSecret, async (req, res) => {
-  const discordUserId = String(req.params?.discordUserId || "").trim();
-  if (!discordUserId) {
-    return res.status(400).json({
-      error: "invalid_discord_user_id",
-      message: "discordUserId path param is required."
-    });
-  }
-  try {
-    const status = await tokenStore.getStatusForUser(discordUserId);
-    return res.json({
-      ok: true,
+      tier: tierConfig.tier,
+      monthlyGenerationLimit: String(tierConfig.monthlyGenerationLimit),
       discordUserId,
-      ...status
-    });
-  } catch (error) {
-    return res.status(500).json({
-      error: "token_status_failed",
-      message: error.message || "Failed to fetch token status."
-    });
-  }
-});
+      expiresAt: issued.record.expiresAt || ""
+    };
+    const redirect = returnUrl ? buildRedirectUrl(returnUrl, payload) : null;
+    if (redirect) {
+      return res.redirect(302, redirect);
+    }
 
-app.post("/api/tokens/validate", requireBotSecret, async (req, res) => {
-  const token = String(req.body?.token || "").trim();
-  if (!token) {
-    return res.status(400).json({
-      error: "invalid_token",
-      message: "Field 'token' is required."
-    });
-  }
-  try {
-    const record = await tokenStore.validateToken(token);
     return res.json({
-      valid: Boolean(record),
-      discordUserId: record?.discordUserId || null,
-      status: record?.status || "none"
+      ok: true,
+      ...payload
     });
   } catch (error) {
-    return res.status(500).json({
-      error: "token_validate_failed",
-      message: error.message || "Failed to validate token."
-    });
+    return fail(
+      "discord_link_failed",
+      error.message || "Failed to complete Discord linking.",
+      Number(error.status) || 500
+    );
   }
 });
 
 app.get("/api/subscription/status", authorizeSubscriptionToken, (req, res) => {
-  const usage = getOrCreateTokenUsage(req.auth.token);
+  const usage = getOrCreateTokenUsage(getUsageKey(req.auth));
+  const monthlyGenerationLimit =
+    typeof req.auth.monthlyGenerationLimit === "number"
+      ? req.auth.monthlyGenerationLimit
+      : null;
+  const remainingGenerations =
+    req.auth.unlimited || monthlyGenerationLimit === null
+      ? null
+      : Math.max(0, monthlyGenerationLimit - usage.generations);
   res.json({
     active: true,
     unlimited: req.auth.unlimited,
-    tier: req.auth.isOwner ? "owner" : "subscriber",
+    tier: req.auth.isOwner ? "owner" : req.auth.tier || "subscriber",
     month: monthKey(),
-    usage
+    usage,
+    monthlyGenerationLimit,
+    remainingGenerations,
+    expiresAt: req.auth.expiresAt || null
   });
 });
 
@@ -353,7 +480,20 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       throw new Error("No image URL returned by BFL.");
     }
 
-    const usage = getOrCreateTokenUsage(req.auth.token);
+    const usage = getOrCreateTokenUsage(getUsageKey(req.auth));
+    if (
+      !req.auth.unlimited &&
+      typeof req.auth.monthlyGenerationLimit === "number" &&
+      usage.generations >= req.auth.monthlyGenerationLimit
+    ) {
+      return res.status(429).json({
+        error: "quota_exceeded",
+        message: "Monthly generation quota reached for your subscription tier.",
+        monthlyGenerationLimit: req.auth.monthlyGenerationLimit,
+        month: monthKey(),
+        usage
+      });
+    }
     usage.generations += 1;
     usage.generatedImages += imageCount;
     usage.lastUsedAt = new Date().toISOString();
@@ -397,39 +537,6 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       details: error.details || null
     });
   }
-});
-
-app.get("/api/auth/patreon/connect", (req, res) => {
-  const returnUrl = String(req.query.returnUrl || "").trim();
-  const clientId = process.env.PATREON_CLIENT_ID || "";
-  const redirectUri = process.env.PATREON_REDIRECT_URI || "";
-  const scope = process.env.PATREON_SCOPE || "identity identity.memberships campaigns";
-  const statePayload = Buffer.from(
-    JSON.stringify({
-      returnUrl,
-      ts: Date.now()
-    })
-  ).toString("base64url");
-
-  if (!clientId || !redirectUri) {
-    return res.status(400).json({
-      error: "patreon_not_configured",
-      message: "PATREON_CLIENT_ID and PATREON_REDIRECT_URI are required.",
-      returnUrl
-    });
-  }
-
-  const connectUrl = new URL("https://www.patreon.com/oauth2/authorize");
-  connectUrl.searchParams.set("response_type", "code");
-  connectUrl.searchParams.set("client_id", clientId);
-  connectUrl.searchParams.set("redirect_uri", redirectUri);
-  connectUrl.searchParams.set("scope", scope);
-  connectUrl.searchParams.set("state", statePayload);
-
-  res.json({
-    connectUrl: connectUrl.toString(),
-    returnUrl
-  });
 });
 
 app.post("/api/maps/reuse/exact", (req, res) => {

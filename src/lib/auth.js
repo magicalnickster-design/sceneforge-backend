@@ -18,25 +18,6 @@ function parseStaticTokens(value = "") {
   );
 }
 
-function createBotSecretMiddleware(secret) {
-  return function botSecretMiddleware(req, res, next) {
-    if (!secret) {
-      return res.status(503).json({
-        error: "bot_secret_not_configured",
-        message: "BOT_SHARED_SECRET is required for token admin endpoints."
-      });
-    }
-    const headerSecret = req.headers["x-bot-secret"];
-    if (!safeCompare(String(headerSecret || ""), secret)) {
-      return res.status(401).json({
-        error: "unauthorized_bot",
-        message: "Invalid bot secret."
-      });
-    }
-    return next();
-  };
-}
-
 function createSubscriptionAuthorizer({
   ownerAccessToken,
   staticSubscriptionTokens,
@@ -78,9 +59,15 @@ function createSubscriptionAuthorizer({
           token,
           isOwner: false,
           unlimited: false,
-          source: "discord-bot",
+          source: "managed-token",
           discordUserId: record.discordUserId,
-          recordId: record.id
+          recordId: record.id,
+          tier: record.tier || "subscriber",
+          monthlyGenerationLimit:
+            typeof record.monthlyGenerationLimit === "number"
+              ? record.monthlyGenerationLimit
+              : null,
+          expiresAt: record.expiresAt || null
         };
         return next();
       }
@@ -98,6 +85,5 @@ function createSubscriptionAuthorizer({
 module.exports = {
   parseBearerToken,
   parseStaticTokens,
-  createBotSecretMiddleware,
   createSubscriptionAuthorizer
 };

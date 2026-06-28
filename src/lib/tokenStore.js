@@ -25,8 +25,11 @@ class TokenStore {
   async issueOrGetToken({
     discordUserId,
     rotate = false,
-    source = "discord-bot",
-    notes = ""
+    source = "discord-oauth",
+    notes = "",
+    tier = "subscriber",
+    monthlyGenerationLimit = null,
+    ttlDays = null
   }) {
     const now = this.clock();
     return this._withLock(async () => {
@@ -52,6 +55,10 @@ class TokenStore {
       }
 
       const plainToken = generateApiToken();
+      const expiresAt =
+        typeof ttlDays === "number" && ttlDays > 0
+          ? new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000).toISOString()
+          : null;
       const record = {
         id: crypto.randomUUID(),
         discordUserId,
@@ -62,7 +69,13 @@ class TokenStore {
         revokedAt: null,
         lastUsedAt: null,
         source,
-        notes: notes || ""
+        notes: notes || "",
+        tier,
+        monthlyGenerationLimit:
+          typeof monthlyGenerationLimit === "number"
+            ? monthlyGenerationLimit
+            : null,
+        expiresAt
       };
 
       state.tokens.push(record);
@@ -121,18 +134,37 @@ class TokenStore {
       status: active.status,
       tokenPreview: active.tokenPreview,
       issuedAt: active.issuedAt,
-      lastUsedAt: active.lastUsedAt
+      lastUsedAt: active.lastUsedAt,
+      tier: active.tier || "subscriber",
+      monthlyGenerationLimit:
+        typeof active.monthlyGenerationLimit === "number"
+          ? active.monthlyGenerationLimit
+          : null,
+      expiresAt: active.expiresAt || null
     };
   }
 
   async validateToken(token) {
-    const state = await this._readState();
-    const tokenHash = hashToken(token, this.tokenPepper);
-    const active = state.tokens.find(
-      (tokenRecord) =>
-        tokenRecord.tokenHash === tokenHash && tokenRecord.status === "active"
-    );
-    return active || null;
+    const now = new Date().toISOString();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      const tokenHash = hashToken(token, this.tokenPepper);
+      const active = state.tokens.find(
+        (tokenRecord) =>
+          tokenRecord.tokenHash === tokenHash && tokenRecord.status === "active"
+      );
+      if (!active) {
+        return null;
+      }
+      if (active.expiresAt && new Date(active.expiresAt).getTime() <= Date.now()) {
+        active.status = "revoked";
+        active.revokedAt = now;
+        active.notes = active.notes || "expired";
+        await this._writeState(state);
+        return null;
+      }
+      return active;
+    });
   }
 
   async touchLastUsedById(id) {
