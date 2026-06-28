@@ -1,0 +1,13 @@
+{
+  "name": "sceneforge-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "register": "node register-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0"
+  }
+}
