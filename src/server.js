@@ -224,11 +224,10 @@ async function fetchJson(url, options = {}) {
   }
 
   if (!response.ok) {
-    const message =
-      (payload && (payload.error || payload.message)) ||
-      `Request failed with status ${response.status}`;
+    const message = extractProviderDetail(payload) || `Request failed with status ${response.status}`;
     const error = new Error(message);
     error.status = response.status;
+    error.detail = message;
     error.details = payload;
     error.requestId = requestId;
     error.endpoint = url;
@@ -238,6 +237,65 @@ async function fetchJson(url, options = {}) {
     payload.requestId = requestId;
   }
   return payload;
+}
+
+function flattenProviderMessages(value, context = {}) {
+  const messages = [];
+  if (value === null || value === undefined) {
+    return messages;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed) {
+      messages.push(trimmed);
+    }
+    return messages;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    messages.push(String(value));
+    return messages;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry) => {
+      messages.push(...flattenProviderMessages(entry, context));
+    });
+    return messages;
+  }
+
+  if (typeof value === "object") {
+    const location = Array.isArray(value.loc) ? value.loc.join(".") : "";
+    const msg = typeof value.msg === "string" ? value.msg.trim() : "";
+    if (msg) {
+      messages.push(location ? `${location}: ${msg}` : msg);
+    }
+    if (typeof value.message === "string" && value.message.trim()) {
+      messages.push(value.message.trim());
+    }
+    if (typeof value.error === "string" && value.error.trim()) {
+      messages.push(value.error.trim());
+    }
+    if (value.detail !== undefined) {
+      messages.push(...flattenProviderMessages(value.detail, context));
+    }
+
+    Object.entries(value).forEach(([key, nested]) => {
+      if (["loc", "msg", "message", "error", "detail"].includes(key)) {
+        return;
+      }
+      messages.push(...flattenProviderMessages(nested, context));
+    });
+  }
+
+  return messages;
+}
+
+function extractProviderDetail(payload) {
+  const messages = flattenProviderMessages(payload);
+  const deduped = [...new Set(messages.map((m) => m.trim()).filter(Boolean))];
+  if (deduped.length > 0) {
+    return deduped.join(" | ");
+  }
+  return null;
 }
 
 function redactSensitive(value) {
@@ -289,25 +347,29 @@ function createGenerationError(reason, detail, meta = {}) {
 
 function classifyGenerationReason(error) {
   const detail = String(error?.detail || error?.message || "").toLowerCase();
-  if (detail.includes("credit") || detail.includes("insufficient")) {
-    return "insufficient_credits";
-  }
   if (detail.includes("timeout")) {
     return "provider_timeout";
   }
-  if (detail.includes("prompt")) {
-    return "invalid_prompt";
+  if (detail.includes("credit") || detail.includes("insufficient")) {
+    return "insufficient_credits";
   }
   const upstreamStatus = Number(error?.upstreamStatus || error?.status);
   if (upstreamStatus >= 400) {
     return `upstream_${upstreamStatus}`;
+  }
+  if (detail.includes("prompt")) {
+    return "invalid_prompt";
   }
   return "provider_error";
 }
 
 function buildGenerationFailure(error) {
   const upstreamStatus = Number(error?.upstreamStatus || error?.status) || null;
-  const detail = error?.detail || error?.message || "Failed to generate map image.";
+  const detail =
+    error?.detail ||
+    extractProviderDetail(error?.upstream || error?.details) ||
+    error?.message ||
+    "Failed to generate map image.";
   return {
     statusCode: upstreamStatus && upstreamStatus >= 400 ? upstreamStatus : 500,
     payload: {
@@ -316,7 +378,7 @@ function buildGenerationFailure(error) {
       detail,
       provider: PROVIDER_NAME,
       model: MODEL_NAME,
-      endpoint: BFL_GENERATE_ENDPOINT,
+      endpoint: error?.endpoint || BFL_GENERATE_ENDPOINT,
       upstreamStatus,
       generationId: error?.generationId || null,
       requestId: error?.requestId || null,
@@ -401,12 +463,13 @@ async function pollBflResult(initialPayload, generationId = null) {
     const status = String(resultPayload?.status || resultPayload?.result?.status || "").toLowerCase();
     lastStatus = status;
     if (status === "failed" || resultPayload?.error) {
+      const providerDetail = extractProviderDetail(resultPayload);
       throw createGenerationError(
         classifyGenerationReason({
           status: 422,
-          detail: resultPayload?.error || "BFL reported generation failure."
+          detail: providerDetail || "BFL reported generation failure."
         }),
-        resultPayload?.error || "BFL reported generation failure.",
+        providerDetail || "BFL reported generation failure.",
         {
           status: 422,
           upstreamStatus: 422,
@@ -706,7 +769,9 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
         upstreamStatus: failure.payload.upstreamStatus,
         reason: failure.payload.reason,
         detail: failure.payload.detail,
-        generationId: failure.payload.generationId
+        generationId: failure.payload.generationId,
+        requestId: failure.payload.requestId,
+        upstream: failure.payload.upstream
       })
     );
     return res.status(failure.statusCode).json(failure.payload);
