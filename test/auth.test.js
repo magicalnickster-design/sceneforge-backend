@@ -9,6 +9,7 @@ test("subscription authorizer supports static fallback tokens", async () => {
   const middleware = createSubscriptionAuthorizer({
     ownerAccessToken: "owner",
     staticSubscriptionTokens: parseStaticTokens("legacy_a,legacy_b"),
+    allowStaticSubscriptionTokens: true,
     tokenStore: {
       async validateToken() {
         return null;
@@ -40,6 +41,45 @@ test("subscription authorizer supports static fallback tokens", async () => {
 
   assert.equal(nextCalled, true);
   assert.equal(req.auth.source, "static");
+});
+
+test("subscription authorizer blocks static fallback when disabled", async () => {
+  const middleware = createSubscriptionAuthorizer({
+    ownerAccessToken: "owner",
+    staticSubscriptionTokens: parseStaticTokens("legacy_a,legacy_b"),
+    allowStaticSubscriptionTokens: false,
+    tokenStore: {
+      async validateToken() {
+        return null;
+      }
+    }
+  });
+
+  const req = {
+    headers: {
+      authorization: "Bearer legacy_a"
+    }
+  };
+  const result = { statusCode: 200, body: null };
+  const res = {
+    status(code) {
+      result.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      result.body = payload;
+      return this;
+    }
+  };
+
+  let nextCalled = false;
+  await middleware(req, res, () => {
+    nextCalled = true;
+  });
+
+  assert.equal(nextCalled, false);
+  assert.equal(result.statusCode, 403);
+  assert.equal(result.body.error, "invalid_subscription_token");
 });
 
 test("subscription authorizer accepts managed token records", async () => {

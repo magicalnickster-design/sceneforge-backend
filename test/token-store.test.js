@@ -66,3 +66,23 @@ test("token store persists monthly usage by key", async () => {
   assert.equal(persisted.generations, 1);
   assert.equal(persisted.generatedImages, 2);
 });
+
+test("token store reserves quota atomically", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-reserve-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const month = "2026-06";
+  const first = await store.tryReserveMonthlyGeneration("discord:123", month, 1);
+  assert.equal(first.reserved, true);
+  assert.equal(first.usage.generations, 1);
+
+  const second = await store.tryReserveMonthlyGeneration("discord:123", month, 1);
+  assert.equal(second.reserved, false);
+  assert.equal(second.usage.generations, 1);
+
+  await store.releaseMonthlyGenerationReservation("discord:123", month);
+  const afterRelease = await store.getMonthlyUsage("discord:123", month);
+  assert.equal(afterRelease.generations, 0);
+});

@@ -21,6 +21,7 @@ function parseStaticTokens(value = "") {
 function createSubscriptionAuthorizer({
   ownerAccessToken,
   staticSubscriptionTokens,
+  allowStaticSubscriptionTokens = false,
   tokenStore
 }) {
   return async function authorizeSubscriptionToken(req, res, next) {
@@ -43,7 +44,7 @@ function createSubscriptionAuthorizer({
         return next();
       }
 
-      if (staticSubscriptionTokens.has(token)) {
+      if (allowStaticSubscriptionTokens && staticSubscriptionTokens.has(token)) {
         req.auth = {
           token,
           isOwner: false,

@@ -243,6 +243,83 @@ class TokenStore {
     });
   }
 
+  async tryReserveMonthlyGeneration(usageKey, month, limit) {
+    const now = this.clock();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      if (!state.usageByMonth[month]) {
+        state.usageByMonth[month] = {};
+      }
+      if (!state.usageByMonth[month][usageKey]) {
+        state.usageByMonth[month][usageKey] = {
+          generatedImages: 0,
+          generations: 0,
+          lastUsedAt: null
+        };
+      }
+      const usage = state.usageByMonth[month][usageKey];
+      const currentGenerations = Number(usage.generations || 0);
+      if (typeof limit === "number" && currentGenerations >= limit) {
+        return {
+          reserved: false,
+          usage: {
+            generatedImages: Number(usage.generatedImages || 0),
+            generations: currentGenerations,
+            lastUsedAt: usage.lastUsedAt || null
+          }
+        };
+      }
+      usage.generations = currentGenerations + 1;
+      usage.lastUsedAt = now;
+      await this._writeState(state);
+      return {
+        reserved: true,
+        usage: {
+          generatedImages: Number(usage.generatedImages || 0),
+          generations: Number(usage.generations || 0),
+          lastUsedAt: usage.lastUsedAt || null
+        }
+      };
+    });
+  }
+
+  async releaseMonthlyGenerationReservation(usageKey, month) {
+    return this._withLock(async () => {
+      const state = await this._readState();
+      const usage = state.usageByMonth?.[month]?.[usageKey];
+      if (!usage) {
+        return;
+      }
+      usage.generations = Math.max(0, Number(usage.generations || 0) - 1);
+      await this._writeState(state);
+    });
+  }
+
+  async finalizeMonthlyGenerationImages(usageKey, month, imageCount) {
+    return this._withLock(async () => {
+      const state = await this._readState();
+      if (!state.usageByMonth[month]) {
+        state.usageByMonth[month] = {};
+      }
+      if (!state.usageByMonth[month][usageKey]) {
+        state.usageByMonth[month][usageKey] = {
+          generatedImages: 0,
+          generations: 0,
+          lastUsedAt: null
+        };
+      }
+      const usage = state.usageByMonth[month][usageKey];
+      usage.generatedImages = Number(usage.generatedImages || 0) + Number(imageCount || 0);
+      usage.lastUsedAt = this.clock();
+      await this._writeState(state);
+      return {
+        generatedImages: Number(usage.generatedImages || 0),
+        generations: Number(usage.generations || 0),
+        lastUsedAt: usage.lastUsedAt || null
+      };
+    });
+  }
+
   async _readState() {
     const raw = await fs.readFile(this.dbPath, "utf8");
     const parsed = JSON.parse(raw);

@@ -13,6 +13,8 @@ const PORT = Number(process.env.PORT || 3000);
 const BFL_API_KEY = process.env.BFL_API_KEY || "";
 const OWNER_ACCESS_TOKEN = process.env.OWNER_ACCESS_TOKEN || "";
 const SUBSCRIPTION_TOKENS = parseStaticTokens(process.env.SUBSCRIPTION_TOKENS || "");
+const ALLOW_STATIC_SUBSCRIPTION_TOKENS =
+  String(process.env.ALLOW_STATIC_SUBSCRIPTION_TOKENS || "").toLowerCase() === "true";
 const DEFAULT_IMAGE_COUNT = Math.max(
   1,
   Number(process.env.DEFAULT_IMAGE_COUNT || 1)
@@ -29,6 +31,14 @@ const ESTIMATED_COST_PER_IMAGE = Number(process.env.ESTIMATED_COST_PER_IMAGE || 
 const MAX_PROXY_IMAGE_BYTES = Math.max(
   1024 * 1024,
   Number(process.env.MAX_PROXY_IMAGE_BYTES || 15 * 1024 * 1024)
+);
+const GENERATE_RATE_LIMIT_PER_MIN = Math.max(
+  1,
+  Number(process.env.GENERATE_RATE_LIMIT_PER_MIN || 20)
+);
+const IMAGE_FETCH_RATE_LIMIT_PER_MIN = Math.max(
+  1,
+  Number(process.env.IMAGE_FETCH_RATE_LIMIT_PER_MIN || 40)
 );
 const TOKEN_SIGNING_PEPPER = process.env.TOKEN_SIGNING_PEPPER || "";
 const DB_PATH =
@@ -66,6 +76,7 @@ const MODEL_NAME = "flux-2-flex";
 const ALLOWED_IMAGE_HOST_SUFFIXES = [".bfl.ai"];
 
 const mapLibrary = new Map();
+const rateLimitBuckets = new Map();
 const tokenStore = new TokenStore({
   dbPath: DB_PATH,
   tokenPepper: TOKEN_SIGNING_PEPPER
@@ -78,6 +89,7 @@ app.use(express.json({ limit: "2mb" }));
 const authorizeSubscriptionToken = createSubscriptionAuthorizer({
   ownerAccessToken: OWNER_ACCESS_TOKEN,
   staticSubscriptionTokens: SUBSCRIPTION_TOKENS,
+  allowStaticSubscriptionTokens: ALLOW_STATIC_SUBSCRIPTION_TOKENS,
   tokenStore
 });
 
@@ -89,6 +101,28 @@ function monthKey(date = new Date()) {
 
 function getUsageKey(auth) {
   return auth.discordUserId || auth.token;
+}
+
+function applyRateLimit({ key, limit, windowMs, bucketPrefix }) {
+  const now = Date.now();
+  const bucketKey = `${bucketPrefix}:${key}`;
+  const existing = rateLimitBuckets.get(bucketKey);
+  if (!existing || now > existing.resetAt) {
+    rateLimitBuckets.set(bucketKey, {
+      count: 1,
+      resetAt: now + windowMs
+    });
+    return { allowed: true };
+  }
+  if (existing.count >= limit) {
+    return {
+      allowed: false,
+      retryAfterMs: Math.max(0, existing.resetAt - now)
+    };
+  }
+  existing.count += 1;
+  rateLimitBuckets.set(bucketKey, existing);
+  return { allowed: true };
 }
 
 function getTierFromRoles(roles = []) {
@@ -802,25 +836,44 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
     }
   });
 
+  const usageKey = getUsageKey(req.auth);
+  const usageMonth = monthKey();
+  let reservedGeneration = false;
   try {
     const entitled = await syncManagedDiscordEntitlement(req, res);
     if (!entitled) {
       return;
     }
-    const usageMonth = monthKey();
-    const usage = await tokenStore.getMonthlyUsage(getUsageKey(req.auth), usageMonth);
-    if (
-      !req.auth.unlimited &&
-      typeof req.auth.monthlyGenerationLimit === "number" &&
-      usage.generations >= req.auth.monthlyGenerationLimit
-    ) {
+    const rateLimit = applyRateLimit({
+      key: usageKey,
+      limit: GENERATE_RATE_LIMIT_PER_MIN,
+      windowMs: 60 * 1000,
+      bucketPrefix: "generate"
+    });
+    if (!rateLimit.allowed) {
       return res.status(429).json({
-        error: "quota_exceeded",
-        message: "Monthly generation quota reached for your subscription tier.",
-        monthlyGenerationLimit: req.auth.monthlyGenerationLimit,
-        month: usageMonth,
-        usage
+        error: "rate_limited",
+        reason: "generate_rate_limited",
+        detail: "Too many generation requests. Please retry shortly.",
+        retryAfterMs: rateLimit.retryAfterMs
       });
+    }
+    if (!req.auth.unlimited && typeof req.auth.monthlyGenerationLimit === "number") {
+      const reservation = await tokenStore.tryReserveMonthlyGeneration(
+        usageKey,
+        usageMonth,
+        req.auth.monthlyGenerationLimit
+      );
+      if (!reservation.reserved) {
+        return res.status(429).json({
+          error: "quota_exceeded",
+          message: "Monthly generation quota reached for your subscription tier.",
+          monthlyGenerationLimit: req.auth.monthlyGenerationLimit,
+          month: usageMonth,
+          usage: reservation.usage
+        });
+      }
+      reservedGeneration = true;
     }
 
     const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
@@ -846,7 +899,11 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
         upstream: result
       });
     }
-    await tokenStore.incrementMonthlyUsage(getUsageKey(req.auth), usageMonth, imageCount);
+    if (reservedGeneration) {
+      await tokenStore.finalizeMonthlyGenerationImages(usageKey, usageMonth, imageCount);
+    } else {
+      await tokenStore.incrementMonthlyUsage(usageKey, usageMonth, imageCount);
+    }
     if (req.auth.recordId) {
       await tokenStore.touchLastUsedById(req.auth.recordId);
     }
@@ -875,6 +932,9 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       }
     });
   } catch (error) {
+    if (reservedGeneration) {
+      await tokenStore.releaseMonthlyGenerationReservation(usageKey, usageMonth);
+    }
     const failure = buildGenerationFailure(error);
     console.error(
       JSON.stringify({
@@ -912,6 +972,24 @@ app.post("/api/maps/image/fetch", authorizeSubscriptionToken, async (req, res) =
   }
 
   try {
+    const entitled = await syncManagedDiscordEntitlement(req, res);
+    if (!entitled) {
+      return;
+    }
+    const rateLimit = applyRateLimit({
+      key: getUsageKey(req.auth),
+      limit: IMAGE_FETCH_RATE_LIMIT_PER_MIN,
+      windowMs: 60 * 1000,
+      bucketPrefix: "image-fetch"
+    });
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        error: "rate_limited",
+        reason: "image_fetch_rate_limited",
+        detail: "Too many image fetch requests. Please retry shortly.",
+        retryAfterMs: rateLimit.retryAfterMs
+      });
+    }
     const fetched = await fetchImageAsBase64(imageUrl);
     const extension = extensionFromContentType(fetched.contentType);
     return res.json({
@@ -962,6 +1040,24 @@ app.post("/api/maps/image/proxy", authorizeSubscriptionToken, async (req, res) =
   }
 
   try {
+    const entitled = await syncManagedDiscordEntitlement(req, res);
+    if (!entitled) {
+      return;
+    }
+    const rateLimit = applyRateLimit({
+      key: getUsageKey(req.auth),
+      limit: IMAGE_FETCH_RATE_LIMIT_PER_MIN,
+      windowMs: 60 * 1000,
+      bucketPrefix: "image-proxy"
+    });
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        error: "rate_limited",
+        reason: "image_fetch_rate_limited",
+        detail: "Too many image proxy requests. Please retry shortly.",
+        retryAfterMs: rateLimit.retryAfterMs
+      });
+    }
     const fetched = await fetchImageAsBase64(imageUrl);
     return res.json({
       ok: true,
