@@ -46,3 +46,23 @@ test("token store issues, reuses, rotates, and revokes tokens", async () => {
   const status = await store.getStatusForUser("123");
   assert.equal(status.hasActiveToken, false);
 });
+
+test("token store persists monthly usage by key", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-usage-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const month = "2026-06";
+  const before = await store.getMonthlyUsage("discord:123", month);
+  assert.equal(before.generations, 0);
+  assert.equal(before.generatedImages, 0);
+
+  const after = await store.incrementMonthlyUsage("discord:123", month, 2);
+  assert.equal(after.generations, 1);
+  assert.equal(after.generatedImages, 2);
+
+  const persisted = await store.getMonthlyUsage("discord:123", month);
+  assert.equal(persisted.generations, 1);
+  assert.equal(persisted.generatedImages, 2);
+});

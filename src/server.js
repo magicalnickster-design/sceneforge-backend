@@ -66,7 +66,6 @@ const MODEL_NAME = "flux-2-flex";
 const ALLOWED_IMAGE_HOST_SUFFIXES = [".bfl.ai"];
 
 const mapLibrary = new Map();
-const monthlyUsageCounters = {};
 const tokenStore = new TokenStore({
   dbPath: DB_PATH,
   tokenPepper: TOKEN_SIGNING_PEPPER
@@ -86,21 +85,6 @@ function monthKey(date = new Date()) {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
   return `${year}-${month}`;
-}
-
-function getOrCreateTokenUsage(usageKey) {
-  const currentMonth = monthKey();
-  if (!monthlyUsageCounters[currentMonth]) {
-    monthlyUsageCounters[currentMonth] = {};
-  }
-  if (!monthlyUsageCounters[currentMonth][usageKey]) {
-    monthlyUsageCounters[currentMonth][usageKey] = {
-      generatedImages: 0,
-      generations: 0,
-      lastUsedAt: null
-    };
-  }
-  return monthlyUsageCounters[currentMonth][usageKey];
 }
 
 function getUsageKey(auth) {
@@ -167,6 +151,36 @@ function buildRedirectUrl(returnUrl, params) {
   } catch {
     return null;
   }
+}
+
+async function syncManagedDiscordEntitlement(req, res) {
+  if (req.auth.source !== "managed-token" || !req.auth.discordUserId) {
+    return true;
+  }
+
+  const membership = await fetchGuildMember({ discordUserId: req.auth.discordUserId });
+  if (!membership.ok) {
+    res.status(membership.statusCode).json({
+      error: membership.error,
+      message: membership.message
+    });
+    return false;
+  }
+
+  const tierConfig = getTierFromRoles(membership.roles);
+  if (!tierConfig) {
+    await tokenStore.revokeActiveTokenForUser(req.auth.discordUserId, "role_removed");
+    res.status(403).json({
+      error: "not_entitled",
+      message: "Discord role entitlement not found."
+    });
+    return false;
+  }
+
+  req.auth.tier = tierConfig.tier;
+  req.auth.monthlyGenerationLimit = tierConfig.monthlyGenerationLimit;
+  await tokenStore.updateManagedTokenEntitlementById(req.auth.recordId, tierConfig);
+  return true;
 }
 
 async function exchangeDiscordCodeForUser(code) {
@@ -711,8 +725,12 @@ app.get("/api/auth/discord/callback", async (req, res) => {
   }
 });
 
-app.get("/api/subscription/status", authorizeSubscriptionToken, (req, res) => {
-  const usage = getOrCreateTokenUsage(getUsageKey(req.auth));
+app.get("/api/subscription/status", authorizeSubscriptionToken, async (req, res) => {
+  const entitled = await syncManagedDiscordEntitlement(req, res);
+  if (!entitled) {
+    return;
+  }
+  const usage = await tokenStore.getMonthlyUsage(getUsageKey(req.auth), monthKey());
   const monthlyGenerationLimit =
     typeof req.auth.monthlyGenerationLimit === "number"
       ? req.auth.monthlyGenerationLimit
@@ -785,6 +803,26 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
   });
 
   try {
+    const entitled = await syncManagedDiscordEntitlement(req, res);
+    if (!entitled) {
+      return;
+    }
+    const usageMonth = monthKey();
+    const usage = await tokenStore.getMonthlyUsage(getUsageKey(req.auth), usageMonth);
+    if (
+      !req.auth.unlimited &&
+      typeof req.auth.monthlyGenerationLimit === "number" &&
+      usage.generations >= req.auth.monthlyGenerationLimit
+    ) {
+      return res.status(429).json({
+        error: "quota_exceeded",
+        message: "Monthly generation quota reached for your subscription tier.",
+        monthlyGenerationLimit: req.auth.monthlyGenerationLimit,
+        month: usageMonth,
+        usage
+      });
+    }
+
     const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
       method: "POST",
       headers: {
@@ -808,24 +846,7 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
         upstream: result
       });
     }
-
-    const usage = getOrCreateTokenUsage(getUsageKey(req.auth));
-    if (
-      !req.auth.unlimited &&
-      typeof req.auth.monthlyGenerationLimit === "number" &&
-      usage.generations >= req.auth.monthlyGenerationLimit
-    ) {
-      return res.status(429).json({
-        error: "quota_exceeded",
-        message: "Monthly generation quota reached for your subscription tier.",
-        monthlyGenerationLimit: req.auth.monthlyGenerationLimit,
-        month: monthKey(),
-        usage
-      });
-    }
-    usage.generations += 1;
-    usage.generatedImages += imageCount;
-    usage.lastUsedAt = new Date().toISOString();
+    await tokenStore.incrementMonthlyUsage(getUsageKey(req.auth), usageMonth, imageCount);
     if (req.auth.recordId) {
       await tokenStore.touchLastUsedById(req.auth.recordId);
     }

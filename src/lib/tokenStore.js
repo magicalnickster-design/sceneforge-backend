@@ -18,7 +18,7 @@ class TokenStore {
     try {
       await fs.access(this.dbPath);
     } catch {
-      await this._writeState({ version: 1, tokens: [] });
+      await this._writeState({ version: 2, tokens: [], usageByMonth: {} });
     }
   }
 
@@ -181,12 +181,78 @@ class TokenStore {
     });
   }
 
+  async updateManagedTokenEntitlementById(id, { tier, monthlyGenerationLimit }) {
+    return this._withLock(async () => {
+      const state = await this._readState();
+      const record = state.tokens.find(
+        (tokenRecord) => tokenRecord.id === id && tokenRecord.status === "active"
+      );
+      if (!record) {
+        return null;
+      }
+      if (tier) {
+        record.tier = tier;
+      }
+      if (typeof monthlyGenerationLimit === "number") {
+        record.monthlyGenerationLimit = monthlyGenerationLimit;
+      }
+      await this._writeState(state);
+      return record;
+    });
+  }
+
+  async getMonthlyUsage(usageKey, month) {
+    const state = await this._readState();
+    const monthBucket = state.usageByMonth[month] || {};
+    const usage = monthBucket[usageKey] || {
+      generatedImages: 0,
+      generations: 0,
+      lastUsedAt: null
+    };
+    return {
+      generatedImages: Number(usage.generatedImages || 0),
+      generations: Number(usage.generations || 0),
+      lastUsedAt: usage.lastUsedAt || null
+    };
+  }
+
+  async incrementMonthlyUsage(usageKey, month, imageCount) {
+    const now = this.clock();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      if (!state.usageByMonth[month]) {
+        state.usageByMonth[month] = {};
+      }
+      if (!state.usageByMonth[month][usageKey]) {
+        state.usageByMonth[month][usageKey] = {
+          generatedImages: 0,
+          generations: 0,
+          lastUsedAt: null
+        };
+      }
+      const usage = state.usageByMonth[month][usageKey];
+      usage.generations = Number(usage.generations || 0) + 1;
+      usage.generatedImages = Number(usage.generatedImages || 0) + Number(imageCount || 0);
+      usage.lastUsedAt = now;
+      await this._writeState(state);
+      return {
+        generatedImages: usage.generatedImages,
+        generations: usage.generations,
+        lastUsedAt: usage.lastUsedAt
+      };
+    });
+  }
+
   async _readState() {
     const raw = await fs.readFile(this.dbPath, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed.tokens || !Array.isArray(parsed.tokens)) {
-      return { version: 1, tokens: [] };
+      return { version: 2, tokens: [], usageByMonth: {} };
     }
+    if (!parsed.usageByMonth || typeof parsed.usageByMonth !== "object") {
+      parsed.usageByMonth = {};
+    }
+    parsed.version = Number(parsed.version || 2);
     return parsed;
   }
 
