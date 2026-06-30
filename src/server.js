@@ -587,6 +587,23 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
 
   const prompt = String(req.body?.prompt || "").trim();
   const imageCount = Math.max(1, Number(req.body?.imageCount || DEFAULT_IMAGE_COUNT));
+  const rawSeed = req.body?.seed;
+  let normalizedSeed;
+  if (rawSeed !== undefined && rawSeed !== null && String(rawSeed).trim() !== "") {
+    const parsedSeed = Number.parseInt(String(rawSeed), 10);
+    if (Number.isFinite(parsedSeed)) {
+      normalizedSeed = parsedSeed;
+    } else {
+      console.warn(
+        JSON.stringify({
+          event: "maps_generate_invalid_seed_ignored",
+          provider: PROVIDER_NAME,
+          model: MODEL_NAME,
+          endpoint: BFL_GENERATE_ENDPOINT
+        })
+      );
+    }
+  }
 
   if (!prompt) {
     return res.status(400).json({
@@ -602,7 +619,7 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
     num_images: imageCount,
     safety_tolerance: Number(req.body?.safety_tolerance || 2),
     output_format: req.body?.output_format || "png",
-    seed: req.body?.seed
+    seed: normalizedSeed
   };
 
   Object.keys(payload).forEach((key) => {
