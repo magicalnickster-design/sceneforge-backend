@@ -9,6 +9,7 @@
     "check": "node --check src/server.js",
     "init-storage": "node scripts/init-storage.js",
     "validate:generate": "node scripts/validate-generate.js",
+    "validate:image-fetch": "node scripts/validate-image-fetch.js",
     "test": "node --test"
   },
   "engines": {

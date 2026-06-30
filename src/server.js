@@ -26,6 +26,10 @@ const BFL_POLL_INTERVAL_MS = Math.max(
   Number(process.env.BFL_POLL_INTERVAL_MS || 2000)
 );
 const ESTIMATED_COST_PER_IMAGE = Number(process.env.ESTIMATED_COST_PER_IMAGE || 0);
+const MAX_PROXY_IMAGE_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.MAX_PROXY_IMAGE_BYTES || 15 * 1024 * 1024)
+);
 const TOKEN_SIGNING_PEPPER = process.env.TOKEN_SIGNING_PEPPER || "";
 const DB_PATH =
   process.env.DB_PATH || path.join(process.cwd(), "data", "tokens.json");
@@ -59,6 +63,7 @@ const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
 const PROVIDER_NAME = "black-forest-labs";
 const MODEL_NAME = "flux-2-flex";
+const ALLOWED_IMAGE_HOST_SUFFIXES = [".bfl.ai"];
 
 const mapLibrary = new Map();
 const monthlyUsageCounters = {};
@@ -384,6 +389,94 @@ function buildGenerationFailure(error) {
       requestId: error?.requestId || null,
       upstream: redactSensitive(error?.upstream || error?.details || null)
     }
+  };
+}
+
+function isAllowedImageHost(hostname) {
+  const normalized = String(hostname || "").toLowerCase();
+  return ALLOWED_IMAGE_HOST_SUFFIXES.some(
+    (suffix) => normalized === suffix.slice(1) || normalized.endsWith(suffix)
+  );
+}
+
+function isAllowedImageUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    return parsed.protocol === "https:" && isAllowedImageHost(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function extensionFromContentType(contentType = "") {
+  const normalized = String(contentType).toLowerCase();
+  if (normalized.includes("png")) {
+    return "png";
+  }
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) {
+    return "jpg";
+  }
+  if (normalized.includes("webp")) {
+    return "webp";
+  }
+  if (normalized.includes("gif")) {
+    return "gif";
+  }
+  return "bin";
+}
+
+async function fetchImageAsBase64(imageUrl) {
+  const response = await fetch(imageUrl, {
+    method: "GET"
+  });
+  if (!response.ok) {
+    throw createGenerationError("upstream_image_fetch_failed", `Image fetch failed with status ${response.status}`, {
+      status: response.status,
+      upstreamStatus: response.status,
+      endpoint: imageUrl,
+      requestId:
+        response.headers.get("x-request-id") ||
+        response.headers.get("request-id") ||
+        response.headers.get("cf-ray") ||
+        null
+    });
+  }
+
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const contentLengthHeader = response.headers.get("content-length");
+  const contentLength = Number(contentLengthHeader || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_PROXY_IMAGE_BYTES) {
+    throw createGenerationError(
+      "image_too_large",
+      `Image exceeds max proxy size of ${MAX_PROXY_IMAGE_BYTES} bytes.`,
+      {
+        status: 413,
+        upstreamStatus: 413,
+        endpoint: imageUrl
+      }
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length > MAX_PROXY_IMAGE_BYTES) {
+    throw createGenerationError(
+      "image_too_large",
+      `Image exceeds max proxy size of ${MAX_PROXY_IMAGE_BYTES} bytes.`,
+      {
+        status: 413,
+        upstreamStatus: 413,
+        endpoint: imageUrl
+      }
+    );
+  }
+
+  const base64 = buffer.toString("base64");
+  return {
+    contentType,
+    bytes: buffer.length,
+    base64,
+    dataUrl: `data:${contentType};base64,${base64}`
   };
 }
 
@@ -772,6 +865,103 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
         generationId: failure.payload.generationId,
         requestId: failure.payload.requestId,
         upstream: failure.payload.upstream
+      })
+    );
+    return res.status(failure.statusCode).json(failure.payload);
+  }
+});
+
+app.post("/api/maps/image/fetch", authorizeSubscriptionToken, async (req, res) => {
+  const imageUrl = String(
+    req.body?.imageUrl || req.body?.url || req.body?.image_url || req.body?.imagePath || ""
+  ).trim();
+  if (!imageUrl) {
+    return res.status(400).json({
+      error: "invalid_image_url",
+      reason: "missing_image_url",
+      detail: "Provide imageUrl/url/image_url/imagePath."
+    });
+  }
+  if (!isAllowedImageUrl(imageUrl)) {
+    return res.status(400).json({
+      error: "invalid_image_url",
+      reason: "disallowed_image_host",
+      detail: "Image URL must be https and hosted on an allowed BFL domain."
+    });
+  }
+
+  try {
+    const fetched = await fetchImageAsBase64(imageUrl);
+    const extension = extensionFromContentType(fetched.contentType);
+    return res.json({
+      ok: true,
+      provider: PROVIDER_NAME,
+      model: MODEL_NAME,
+      sourceUrl: imageUrl,
+      contentType: fetched.contentType,
+      bytes: fetched.bytes,
+      extension,
+      filename: `sceneforge-${Date.now()}.${extension}`,
+      base64: fetched.base64,
+      dataUrl: fetched.dataUrl
+    });
+  } catch (error) {
+    const failure = buildGenerationFailure(error);
+    console.error(
+      JSON.stringify({
+        event: "maps_image_fetch_failed",
+        endpoint: imageUrl,
+        upstreamStatus: failure.payload.upstreamStatus,
+        reason: failure.payload.reason,
+        detail: failure.payload.detail,
+        requestId: failure.payload.requestId
+      })
+    );
+    return res.status(failure.statusCode).json(failure.payload);
+  }
+});
+
+app.post("/api/maps/image/proxy", authorizeSubscriptionToken, async (req, res) => {
+  const imageUrl = String(
+    req.body?.imageUrl || req.body?.url || req.body?.image_url || req.body?.imagePath || ""
+  ).trim();
+  if (!imageUrl) {
+    return res.status(400).json({
+      error: "invalid_image_url",
+      reason: "missing_image_url",
+      detail: "Provide imageUrl/url/image_url/imagePath."
+    });
+  }
+  if (!isAllowedImageUrl(imageUrl)) {
+    return res.status(400).json({
+      error: "invalid_image_url",
+      reason: "disallowed_image_host",
+      detail: "Image URL must be https and hosted on an allowed BFL domain."
+    });
+  }
+
+  try {
+    const fetched = await fetchImageAsBase64(imageUrl);
+    return res.json({
+      ok: true,
+      provider: PROVIDER_NAME,
+      model: MODEL_NAME,
+      sourceUrl: imageUrl,
+      contentType: fetched.contentType,
+      bytes: fetched.bytes,
+      base64: fetched.base64,
+      dataUrl: fetched.dataUrl
+    });
+  } catch (error) {
+    const failure = buildGenerationFailure(error);
+    console.error(
+      JSON.stringify({
+        event: "maps_image_proxy_failed",
+        endpoint: imageUrl,
+        upstreamStatus: failure.payload.upstreamStatus,
+        reason: failure.payload.reason,
+        detail: failure.payload.detail,
+        requestId: failure.payload.requestId
       })
     );
     return res.status(failure.statusCode).json(failure.payload);
