@@ -1,0 +1,23 @@
+{
+  "name": "sceneforge-backend",
+  "version": "0.1.0",
+  "description": "SceneForge backend for subscription-gated map generation via BFL FLUX.2 Flex",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js",
+    "init-storage": "node scripts/init-storage.js",
+    "validate:generate": "node scripts/validate-generate.js",
+    "validate:image-fetch": "node scripts/validate-image-fetch.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "express": "^4.21.2"
+  }
+}
