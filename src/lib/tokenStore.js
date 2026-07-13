@@ -18,7 +18,13 @@ class TokenStore {
     try {
       await fs.access(this.dbPath);
     } catch {
-      await this._writeState({ version: 2, tokens: [], usageByMonth: {} });
+      await this._writeState({
+        version: 3,
+        tokens: [],
+        usageByMonth: {},
+        oauthStates: [],
+        oneTimeLinkCodes: []
+      });
     }
   }
 
@@ -320,16 +326,107 @@ class TokenStore {
     });
   }
 
+  async createOAuthState({ strategy, returnUrl = "", ttlSeconds = 600, metadata = {} }) {
+    const id = crypto.randomUUID();
+    const nowMs = Date.now();
+    const expiresAt = new Date(nowMs + ttlSeconds * 1000).toISOString();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      state.oauthStates.push({
+        id,
+        strategy,
+        returnUrl,
+        metadata,
+        createdAt: new Date(nowMs).toISOString(),
+        expiresAt,
+        consumedAt: null
+      });
+      await this._writeState(state);
+      return { id, expiresAt };
+    });
+  }
+
+  async consumeOAuthState(id) {
+    const nowMs = Date.now();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      const record = state.oauthStates.find((entry) => entry.id === id);
+      if (!record) {
+        return null;
+      }
+      if (record.consumedAt) {
+        return null;
+      }
+      if (new Date(record.expiresAt).getTime() <= nowMs) {
+        return null;
+      }
+      record.consumedAt = new Date(nowMs).toISOString();
+      await this._writeState(state);
+      return record;
+    });
+  }
+
+  async createOneTimeLinkCode({ payload, ttlSeconds = 120, metadata = {} }) {
+    const plainCode = crypto.randomBytes(24).toString("base64url");
+    const codeHash = hashToken(plainCode, this.tokenPepper);
+    const nowMs = Date.now();
+    const expiresAt = new Date(nowMs + ttlSeconds * 1000).toISOString();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      state.oneTimeLinkCodes.push({
+        id: crypto.randomUUID(),
+        codeHash,
+        payload,
+        metadata,
+        createdAt: new Date(nowMs).toISOString(),
+        expiresAt,
+        consumedAt: null
+      });
+      await this._writeState(state);
+      return {
+        code: plainCode,
+        expiresAt
+      };
+    });
+  }
+
+  async consumeOneTimeLinkCode(code) {
+    const codeHash = hashToken(code, this.tokenPepper);
+    const nowMs = Date.now();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      const record = state.oneTimeLinkCodes.find((entry) => entry.codeHash === codeHash);
+      if (!record) {
+        return null;
+      }
+      if (record.consumedAt) {
+        return null;
+      }
+      if (new Date(record.expiresAt).getTime() <= nowMs) {
+        return null;
+      }
+      record.consumedAt = new Date(nowMs).toISOString();
+      await this._writeState(state);
+      return record.payload || null;
+    });
+  }
+
   async _readState() {
     const raw = await fs.readFile(this.dbPath, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed.tokens || !Array.isArray(parsed.tokens)) {
-      return { version: 2, tokens: [], usageByMonth: {} };
+      return { version: 3, tokens: [], usageByMonth: {}, oauthStates: [], oneTimeLinkCodes: [] };
     }
     if (!parsed.usageByMonth || typeof parsed.usageByMonth !== "object") {
       parsed.usageByMonth = {};
     }
-    parsed.version = Number(parsed.version || 2);
+    if (!Array.isArray(parsed.oauthStates)) {
+      parsed.oauthStates = [];
+    }
+    if (!Array.isArray(parsed.oneTimeLinkCodes)) {
+      parsed.oneTimeLinkCodes = [];
+    }
+    parsed.version = Number(parsed.version || 3);
     return parsed;
   }
 

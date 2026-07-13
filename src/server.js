@@ -6,6 +6,13 @@ const crypto = require("crypto");
 const { TokenStore } = require("./lib/tokenStore");
 const { fetchGuildMember } = require("./lib/discordEntitlement");
 const { parseStaticTokens, createSubscriptionAuthorizer } = require("./lib/auth");
+const {
+  parseAllowedOrigins,
+  validateFoundryReturnUrl,
+  appendQueryParam,
+  appendHashParams,
+  isApprovedExchangeOrigin
+} = require("./lib/returnUrl");
 
 dotenv.config({ quiet: true });
 
@@ -40,6 +47,10 @@ const IMAGE_FETCH_RATE_LIMIT_PER_MIN = Math.max(
   1,
   Number(process.env.IMAGE_FETCH_RATE_LIMIT_PER_MIN || 40)
 );
+const EXCHANGE_CODE_RATE_LIMIT_PER_MIN = Math.max(
+  1,
+  Number(process.env.EXCHANGE_CODE_RATE_LIMIT_PER_MIN || 30)
+);
 const TOKEN_SIGNING_PEPPER = process.env.TOKEN_SIGNING_PEPPER || "";
 const DB_PATH =
   process.env.DB_PATH || path.join(process.cwd(), "data", "tokens.json");
@@ -56,6 +67,9 @@ const DISCORD_ROLE_PATREON_TIER1_ID = process.env.DISCORD_ROLE_PATREON_TIER1_ID 
 const DISCORD_ROLE_PATREON_TIER2_ID = process.env.DISCORD_ROLE_PATREON_TIER2_ID || "";
 const DISCORD_ROLE_PATREON_FOUNDER_ID =
   process.env.DISCORD_ROLE_PATREON_FOUNDER_ID || "";
+const SCENEFORGE_ALLOWED_RETURN_ORIGINS = parseAllowedOrigins(
+  process.env.SCENEFORGE_ALLOWED_RETURN_ORIGINS || ""
+);
 const MONTHLY_GENERATION_LIMIT_TIER1 = Math.max(
   1,
   Number(process.env.MONTHLY_GENERATION_LIMIT_TIER1 || 200)
@@ -83,7 +97,7 @@ const tokenStore = new TokenStore({
 });
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true }));
 app.use(express.json({ limit: "2mb" }));
 
 const authorizeSubscriptionToken = createSubscriptionAuthorizer({
@@ -178,13 +192,68 @@ function decodeState(state) {
 
 function buildRedirectUrl(returnUrl, params) {
   try {
-    const url = new URL(returnUrl);
-    const hashParams = new URLSearchParams(params);
-    url.hash = hashParams.toString();
-    return url.toString();
+    return appendHashParams(returnUrl, params);
   } catch {
     return null;
   }
+}
+
+function hashForLogs(value = "") {
+  return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 12);
+}
+
+function resolveOAuthStrategy(returnUrl) {
+  if (!returnUrl) {
+    return {
+      strategy: "desktop",
+      validatedReturnUrl: "",
+      returnOrigin: null
+    };
+  }
+  const validation = validateFoundryReturnUrl(returnUrl, {
+    allowedOrigins: SCENEFORGE_ALLOWED_RETURN_ORIGINS,
+    allowLocalhost: true
+  });
+  if (!validation.ok) {
+    return {
+      strategy: "invalid",
+      validation
+    };
+  }
+
+  const parsed = new URL(validation.normalizedUrl);
+  const isHosted = parsed.protocol === "https:" && !["localhost", "127.0.0.1", "::1"].includes(parsed.hostname);
+  return {
+    strategy: isHosted ? "hosted" : "desktop",
+    validatedReturnUrl: validation.normalizedUrl,
+    returnOrigin: validation.origin
+  };
+}
+
+function hostedExchangeCors(req, res, next) {
+  const origin = req.headers.origin;
+  if (!origin) {
+    return next();
+  }
+  if (
+    !isApprovedExchangeOrigin(origin, {
+      allowedOrigins: SCENEFORGE_ALLOWED_RETURN_ORIGINS,
+      allowLocalhost: true
+    })
+  ) {
+    return res.status(403).json({
+      error: "forbidden_origin",
+      message: "Origin is not approved for code exchange."
+    });
+  }
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    return res.status(204).end();
+  }
+  return next();
 }
 
 async function syncManagedDiscordEntitlement(req, res) {
@@ -656,36 +725,124 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.get("/api/auth/discord/connect", (req, res) => {
-  const returnUrl = String(req.query.returnUrl || "").trim();
+function handleDiscordConnect(req, res) {
+  const returnUrl = String(req.body?.returnUrl || req.query.returnUrl || "").trim();
   if (!DISCORD_CLIENT_ID || !DISCORD_REDIRECT_URI) {
     return res.status(503).json({
       error: "discord_oauth_not_configured",
       message: "DISCORD_CLIENT_ID and DISCORD_REDIRECT_URI are required."
     });
   }
-  const state = encodeState({
-    returnUrl,
-    ts: Date.now(),
-    nonce: crypto.randomBytes(12).toString("hex")
-  });
-  const connectUrl = new URL("https://discord.com/api/oauth2/authorize");
-  connectUrl.searchParams.set("client_id", DISCORD_CLIENT_ID);
-  connectUrl.searchParams.set("response_type", "code");
-  connectUrl.searchParams.set("redirect_uri", DISCORD_REDIRECT_URI);
-  connectUrl.searchParams.set("scope", "identify");
-  connectUrl.searchParams.set("state", state);
-  res.json({
-    connectUrl: connectUrl.toString(),
-    returnUrl
-  });
-});
+  const strategy = resolveOAuthStrategy(returnUrl);
+  if (strategy.strategy === "invalid") {
+    console.info(
+      JSON.stringify({
+        event: "oauth_return_url_rejected",
+        reason: strategy.validation.reason
+      })
+    );
+    return res.status(400).json({
+      error: "invalid_return_url",
+      reason: strategy.validation.reason,
+      message: strategy.validation.message
+    });
+  }
+
+  tokenStore
+    .createOAuthState({
+      strategy: strategy.strategy,
+      returnUrl: strategy.validatedReturnUrl,
+      ttlSeconds: 600,
+      metadata: {
+        returnOrigin: strategy.returnOrigin,
+        requestedReturnUrlHash: hashForLogs(returnUrl)
+      }
+    })
+    .then((oauthState) => {
+      const state = encodeState({
+        oauthStateId: oauthState.id,
+        ts: Date.now(),
+        nonce: crypto.randomBytes(12).toString("hex")
+      });
+      const connectUrl = new URL("https://discord.com/api/oauth2/authorize");
+      connectUrl.searchParams.set("client_id", DISCORD_CLIENT_ID);
+      connectUrl.searchParams.set("response_type", "code");
+      connectUrl.searchParams.set("redirect_uri", DISCORD_REDIRECT_URI);
+      connectUrl.searchParams.set("scope", "identify");
+      connectUrl.searchParams.set("state", state);
+      console.info(
+        JSON.stringify({
+          event: "oauth_strategy_selected",
+          strategy: strategy.strategy,
+          hasReturnUrl: Boolean(returnUrl)
+        })
+      );
+      res.json({
+        connectUrl: connectUrl.toString(),
+        returnUrl
+      });
+    })
+    .catch((error) => {
+      res.status(500).json({
+        error: "oauth_state_failed",
+        message: error.message || "Failed to initialize OAuth state."
+      });
+    });
+}
+
+app.get("/api/auth/discord/connect", handleDiscordConnect);
+app.post("/api/auth/discord/connect", handleDiscordConnect);
 
 app.get("/api/auth/discord/callback", async (req, res) => {
   const code = String(req.query.code || "").trim();
-  const state = decodeState(String(req.query.state || ""));
-  const returnUrl = state?.returnUrl || "";
-  const fail = (error, message, statusCode = 400) => {
+  const decodedState = decodeState(String(req.query.state || ""));
+  if (!decodedState?.oauthStateId) {
+    return res.status(400).json({
+      error: "invalid_state",
+      message: "OAuth state was invalid or expired."
+    });
+  }
+
+  const oauthState = await tokenStore.consumeOAuthState(decodedState.oauthStateId);
+  if (!oauthState) {
+    return res.status(400).json({
+      error: "invalid_state",
+      message: "OAuth state was invalid or expired."
+    });
+  }
+
+  const strategy = oauthState.strategy || "desktop";
+  const returnUrl = oauthState.returnUrl || "";
+  const respondFailure = async (error, message, statusCode = 400) => {
+    if (strategy === "hosted" && returnUrl) {
+      const exchangePayload = {
+        linked: false,
+        token: "",
+        tier: "",
+        monthlyGenerationLimit: 0,
+        discordUserId: "",
+        expiresAt: "",
+        error,
+        message
+      };
+      const oneTime = await tokenStore.createOneTimeLinkCode({
+        payload: exchangePayload,
+        ttlSeconds: 120,
+        metadata: {
+          strategy: "hosted",
+          error
+        }
+      });
+      console.info(
+        JSON.stringify({
+          event: "oauth_hosted_code_created",
+          outcome: "error",
+          codeHash: hashForLogs(oneTime.code)
+        })
+      );
+      return res.redirect(302, appendQueryParam(returnUrl, "sceneforgeLinkCode", oneTime.code));
+    }
+
     const redirect = returnUrl
       ? buildRedirectUrl(returnUrl, { linked: "false", error, message })
       : null;
@@ -695,28 +852,25 @@ app.get("/api/auth/discord/callback", async (req, res) => {
     return res.status(statusCode).json({ error, message });
   };
 
-  if (!state) {
-    return fail("invalid_state", "OAuth state was invalid or expired.");
-  }
   if (!code) {
-    return fail("missing_code", "Discord callback did not include code.");
+    return respondFailure("missing_code", "Discord callback did not include code.");
   }
 
   try {
     const user = await exchangeDiscordCodeForUser(code);
     const discordUserId = String(user?.id || "").trim();
     if (!discordUserId) {
-      return fail("discord_identity_failed", "Unable to read Discord user identity.", 502);
+      return respondFailure("discord_identity_failed", "Unable to read Discord user identity.", 502);
     }
 
     const membership = await fetchGuildMember({ discordUserId });
     if (!membership.ok) {
-      return fail(membership.error, membership.message, membership.statusCode);
+      return respondFailure(membership.error, membership.message, membership.statusCode);
     }
 
     const tierConfig = getTierFromRoles(membership.roles);
     if (!tierConfig) {
-      return fail(
+      return respondFailure(
         "not_entitled",
         "No entitled Discord tier role found (Patreon Tier 1/2/Founder).",
         403
@@ -733,6 +887,36 @@ app.get("/api/auth/discord/callback", async (req, res) => {
       ttlDays: TOKEN_TTL_DAYS
     });
 
+    const exchangePayload = {
+      linked: true,
+      token: issued.token,
+      tier: tierConfig.tier,
+      monthlyGenerationLimit: tierConfig.monthlyGenerationLimit,
+      discordUserId,
+      expiresAt: issued.record.expiresAt || "",
+      error: "",
+      message: ""
+    };
+
+    if (strategy === "hosted" && returnUrl) {
+      const oneTime = await tokenStore.createOneTimeLinkCode({
+        payload: exchangePayload,
+        ttlSeconds: 120,
+        metadata: {
+          strategy: "hosted",
+          discordUserId
+        }
+      });
+      console.info(
+        JSON.stringify({
+          event: "oauth_hosted_code_created",
+          outcome: "success",
+          codeHash: hashForLogs(oneTime.code)
+        })
+      );
+      return res.redirect(302, appendQueryParam(returnUrl, "sceneforgeLinkCode", oneTime.code));
+    }
+
     const payload = {
       linked: "true",
       token: issued.token,
@@ -745,18 +929,102 @@ app.get("/api/auth/discord/callback", async (req, res) => {
     if (redirect) {
       return res.redirect(302, redirect);
     }
-
     return res.json({
       ok: true,
       ...payload
     });
   } catch (error) {
-    return fail(
+    return respondFailure(
       "discord_link_failed",
       error.message || "Failed to complete Discord linking.",
       Number(error.status) || 500
     );
   }
+});
+
+app.options("/api/auth/discord/exchange-code", hostedExchangeCors);
+app.post("/api/auth/discord/exchange-code", hostedExchangeCors, async (req, res) => {
+  const rateLimit = applyRateLimit({
+    key: req.ip || "unknown",
+    limit: EXCHANGE_CODE_RATE_LIMIT_PER_MIN,
+    windowMs: 60 * 1000,
+    bucketPrefix: "exchange-code"
+  });
+  if (!rateLimit.allowed) {
+    return res.status(429).json({
+      linked: false,
+      token: "",
+      tier: "",
+      monthlyGenerationLimit: 0,
+      discordUserId: "",
+      expiresAt: "",
+      error: "exchange_rate_limited",
+      message: "Too many code exchange attempts."
+    });
+  }
+
+  const code = String(req.body?.code || "").trim();
+  const source = String(req.body?.source || "").trim();
+  if (!code) {
+    return res.status(400).json({
+      linked: false,
+      token: "",
+      tier: "",
+      monthlyGenerationLimit: 0,
+      discordUserId: "",
+      expiresAt: "",
+      error: "invalid_code",
+      message: "Code is required."
+    });
+  }
+
+  console.info(
+    JSON.stringify({
+      event: "oauth_exchange_attempt",
+      source: source || "unknown",
+      codeHash: hashForLogs(code)
+    })
+  );
+
+  const payload = await tokenStore.consumeOneTimeLinkCode(code);
+  if (!payload) {
+    console.info(
+      JSON.stringify({
+        event: "oauth_exchange_failed",
+        source: source || "unknown",
+        codeHash: hashForLogs(code)
+      })
+    );
+    return res.status(400).json({
+      linked: false,
+      token: "",
+      tier: "",
+      monthlyGenerationLimit: 0,
+      discordUserId: "",
+      expiresAt: "",
+      error: "invalid_or_expired_code",
+      message: "Code is invalid or expired."
+    });
+  }
+
+  console.info(
+    JSON.stringify({
+      event: "oauth_exchange_succeeded",
+      source: source || "unknown",
+      discordUserId: payload.discordUserId || ""
+    })
+  );
+
+  return res.json({
+    linked: Boolean(payload.linked),
+    token: payload.token || "",
+    tier: payload.tier || "",
+    monthlyGenerationLimit: Number(payload.monthlyGenerationLimit || 0),
+    discordUserId: payload.discordUserId || "",
+    expiresAt: payload.expiresAt || "",
+    error: payload.error || "",
+    message: payload.message || ""
+  });
 });
 
 app.get("/api/subscription/status", authorizeSubscriptionToken, async (req, res) => {

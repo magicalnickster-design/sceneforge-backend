@@ -86,3 +86,95 @@ test("token store reserves quota atomically", async () => {
   const afterRelease = await store.getMonthlyUsage("discord:123", month);
   assert.equal(afterRelease.generations, 0);
 });
+
+test("one-time link code can only be consumed once", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-code-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const created = await store.createOneTimeLinkCode({
+    payload: { linked: true, token: "tok" },
+    ttlSeconds: 120
+  });
+  const first = await store.consumeOneTimeLinkCode(created.code);
+  assert.equal(first.linked, true);
+  const second = await store.consumeOneTimeLinkCode(created.code);
+  assert.equal(second, null);
+});
+
+test("one-time link code expires", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-code-exp-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const created = await store.createOneTimeLinkCode({
+    payload: { linked: true, token: "tok" },
+    ttlSeconds: 1
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  const consumed = await store.consumeOneTimeLinkCode(created.code);
+  assert.equal(consumed, null);
+});
+
+test("concurrent one-time code exchange allows only one success", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-code-conc-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const created = await store.createOneTimeLinkCode({
+    payload: { linked: true, token: "tok" },
+    ttlSeconds: 120
+  });
+
+  const results = await Promise.all(
+    Array.from({ length: 6 }).map(() => store.consumeOneTimeLinkCode(created.code))
+  );
+  const successCount = results.filter((value) => value && value.linked).length;
+  assert.equal(successCount, 1);
+});
+
+test("oauth state can only be consumed once", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-oauth-state-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const created = await store.createOAuthState({
+    strategy: "hosted",
+    returnUrl: "https://world.forge-vtt.com/game",
+    ttlSeconds: 120
+  });
+  const first = await store.consumeOAuthState(created.id);
+  assert.equal(first.strategy, "hosted");
+  const second = await store.consumeOAuthState(created.id);
+  assert.equal(second, null);
+});
+
+test("one-time code supports error payload exchange", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-code-error-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const created = await store.createOneTimeLinkCode({
+    payload: {
+      linked: false,
+      token: "",
+      tier: "",
+      monthlyGenerationLimit: 0,
+      discordUserId: "",
+      expiresAt: "",
+      error: "not_entitled",
+      message: "No tier role"
+    },
+    ttlSeconds: 120
+  });
+
+  const consumed = await store.consumeOneTimeLinkCode(created.code);
+  assert.equal(consumed.linked, false);
+  assert.equal(consumed.error, "not_entitled");
+  assert.equal(consumed.message, "No tier role");
+});
