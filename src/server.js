@@ -1,11 +1,37 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const path = require("path");
+const jwt = require("jsonwebtoken");
+const { IdempotencyStore } = require("./lib/idempotencyStore");
 
 dotenv.config({ quiet: true });
 
 const app = express();
-app.use(cors());
+const CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type", "Idempotency-Key"];
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
+      try {
+        const parsed = new URL(origin);
+        if (parsed.protocol === "http:" && parsed.hostname === "localhost") {
+          return callback(null, true);
+        }
+        if (parsed.protocol === "https:") {
+          return callback(null, true);
+        }
+      } catch {
+        return callback(new Error("Not allowed by CORS"));
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+    allowedHeaders: CORS_ALLOWED_HEADERS,
+    methods: ["GET", "POST", "OPTIONS"]
+  })
+);
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = Number(process.env.PORT || 3000);
@@ -30,6 +56,19 @@ const BFL_POLL_INTERVAL_MS = Math.max(
   Number(process.env.BFL_POLL_INTERVAL_MS || 2000)
 );
 const ESTIMATED_COST_PER_IMAGE = Number(process.env.ESTIMATED_COST_PER_IMAGE || 0);
+const SESSION_SECRET = process.env.SESSION_SECRET || "";
+const JWT_ALLOWED_ALGORITHMS = (process.env.GAMBITS_JWT_ALGORITHMS || "HS256")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const JWT_ISSUER = process.env.GAMBITS_JWT_ISSUER || "";
+const JWT_AUDIENCE = process.env.GAMBITS_JWT_AUDIENCE || "";
+const IDEMPOTENCY_DB_PATH =
+  process.env.IDEMPOTENCY_DB_PATH || path.join(process.cwd(), "data", "idempotency.sqlite");
+const GENERATE_RATE_LIMIT_PER_MIN = Math.max(
+  1,
+  Number(process.env.GENERATE_RATE_LIMIT_PER_MIN || 20)
+);
 
 const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
@@ -38,6 +77,105 @@ const MODEL_NAME = "flux-2-flex";
 
 const mapLibrary = new Map();
 const monthlyUsageCounters = {};
+const rateLimitBuckets = new Map();
+const idempotencyStore = new IdempotencyStore({
+  dbPath: IDEMPOTENCY_DB_PATH
+});
+let idempotencyReady = false;
+try {
+  idempotencyStore.init();
+  idempotencyReady = true;
+} catch (error) {
+  console.error("Failed to initialize idempotency storage:", error.message);
+}
+
+function normalizeErrorResponse(error, message) {
+  return { error, message };
+}
+
+function applyRateLimit({ key, limit, windowMs, bucketPrefix }) {
+  const now = Date.now();
+  const bucketKey = `${bucketPrefix}:${key}`;
+  const existing = rateLimitBuckets.get(bucketKey);
+  if (!existing || now > existing.resetAt) {
+    rateLimitBuckets.set(bucketKey, { count: 1, resetAt: now + windowMs });
+    return { allowed: true };
+  }
+  if (existing.count >= limit) {
+    return { allowed: false };
+  }
+  existing.count += 1;
+  rateLimitBuckets.set(bucketKey, existing);
+  return { allowed: true };
+}
+
+function isValidUuid(rawValue) {
+  const normalized = String(rawValue || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    normalized
+  );
+}
+
+function requireGambitsJwt(req, res, next) {
+  if (!SESSION_SECRET) {
+    return res
+      .status(503)
+      .json(normalizeErrorResponse("BACKEND_UNAVAILABLE", "Session validation is not configured."));
+  }
+
+  const token = parseBearerToken(req);
+  if (!token) {
+    return res.status(401).json(normalizeErrorResponse("AUTH_REQUIRED", "Bearer token is required."));
+  }
+
+  try {
+    const verifyOptions = {
+      algorithms: JWT_ALLOWED_ALGORITHMS
+    };
+    if (JWT_ISSUER) {
+      verifyOptions.issuer = JWT_ISSUER;
+    }
+    if (JWT_AUDIENCE) {
+      verifyOptions.audience = JWT_AUDIENCE;
+    }
+
+    const payload = jwt.verify(token, SESSION_SECRET, verifyOptions);
+    const userId = String(payload?.sub || payload?.userId || "").trim();
+    if (!userId) {
+      return res.status(401).json(normalizeErrorResponse("AUTH_REQUIRED", "Invalid session token."));
+    }
+
+    const emailVerified = payload?.email_verified === true || payload?.emailVerified === true;
+    if (!emailVerified) {
+      return res
+        .status(403)
+        .json(normalizeErrorResponse("EMAIL_NOT_VERIFIED", "Verified email is required."));
+    }
+
+    req.gambitsAuth = { userId };
+    return next();
+  } catch (error) {
+    if (error && error.name === "TokenExpiredError") {
+      return res
+        .status(401)
+        .json(normalizeErrorResponse("SESSION_EXPIRED", "Session token has expired."));
+    }
+    return res.status(401).json(normalizeErrorResponse("AUTH_REQUIRED", "Invalid session token."));
+  }
+}
+
+function requireIdempotencyKey(req, res, next) {
+  const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
+  if (!isValidUuid(idempotencyKey)) {
+    return res
+      .status(400)
+      .json(
+        normalizeErrorResponse("INVALID_IDEMPOTENCY_KEY", "A valid UUID Idempotency-Key is required.")
+      );
+  }
+  req.idempotencyKey = idempotencyKey;
+  return next();
+}
 
 function monthKey(date = new Date()) {
   const year = date.getUTCFullYear();
@@ -205,22 +343,56 @@ app.get("/api/subscription/status", authorizeSubscriptionToken, (req, res) => {
   });
 });
 
-app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
+app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (req, res) => {
   if (!BFL_API_KEY) {
-    return res.status(500).json({
-      error: "backend_not_configured",
-      message: "BFL_API_KEY is missing on the server."
-    });
+    return res
+      .status(503)
+      .json(normalizeErrorResponse("BACKEND_UNAVAILABLE", "Generation backend is unavailable."));
   }
 
   const prompt = String(req.body?.prompt || "").trim();
   const imageCount = Math.max(1, Number(req.body?.imageCount || DEFAULT_IMAGE_COUNT));
 
   if (!prompt) {
-    return res.status(400).json({
-      error: "invalid_prompt",
-      message: "Field 'prompt' is required."
-    });
+    return res.status(400).json(normalizeErrorResponse("GENERATION_FAILED", "Field 'prompt' is required."));
+  }
+
+  const rateLimit = applyRateLimit({
+    key: req.gambitsAuth.userId,
+    limit: GENERATE_RATE_LIMIT_PER_MIN,
+    windowMs: 60 * 1000,
+    bucketPrefix: "generate"
+  });
+  if (!rateLimit.allowed) {
+    return res.status(429).json(normalizeErrorResponse("RATE_LIMITED", "Too many requests."));
+  }
+
+  let requestState;
+  if (!idempotencyReady) {
+    return res
+      .status(503)
+      .json(normalizeErrorResponse("BACKEND_UNAVAILABLE", "Idempotency storage is unavailable."));
+  }
+  try {
+    requestState = idempotencyStore.beginProcessing(req.gambitsAuth.userId, req.idempotencyKey);
+  } catch {
+    return res
+      .status(503)
+      .json(normalizeErrorResponse("BACKEND_UNAVAILABLE", "Idempotency storage is unavailable."));
+  }
+
+  if (requestState.state === "completed" && requestState.response) {
+    return res.json(requestState.response);
+  }
+  if (requestState.state === "in_progress") {
+    return res
+      .status(409)
+      .json(
+        normalizeErrorResponse(
+          "GENERATION_IN_PROGRESS",
+          "A generation with this idempotency key is already in progress."
+        )
+      );
   }
 
   const payload = {
@@ -257,19 +429,13 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
       throw new Error("No image URL returned by BFL.");
     }
 
-    const usage = getOrCreateTokenUsage(req.auth.token);
-    usage.generations += 1;
-    usage.generatedImages += imageCount;
-    usage.lastUsedAt = new Date().toISOString();
-
     const generationId =
       result?.id ||
       result?.result?.id ||
       initialResponse?.id ||
       initialResponse?.result?.id ||
       null;
-
-    return res.json({
+    const responsePayload = {
       imagePath: imageUrl,
       image_url: imageUrl,
       url: imageUrl,
@@ -289,14 +455,25 @@ app.post("/api/maps/generate", authorizeSubscriptionToken, async (req, res) => {
         generationId,
         imageCount
       }
-    });
+    };
+
+    idempotencyStore.markCompleted(req.gambitsAuth.userId, req.idempotencyKey, responsePayload);
+    return res.json(responsePayload);
   } catch (error) {
-    const statusCode = Number(error.status) || 500;
-    return res.status(statusCode).json({
-      error: "generation_failed",
-      message: error.message || "Failed to generate map image.",
-      details: error.details || null
-    });
+    idempotencyStore.markFailed(
+      req.gambitsAuth.userId,
+      req.idempotencyKey,
+      "GENERATION_FAILED",
+      "Generation failed. Safe retry allowed with the same Idempotency-Key."
+    );
+    return res
+      .status(502)
+      .json(
+        normalizeErrorResponse(
+          "GENERATION_FAILED",
+          "Generation failed. Retry with the same Idempotency-Key."
+        )
+      );
   }
 });
 
@@ -449,6 +626,18 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`SceneForge backend listening on port ${PORT}`);
-});
+function startServer() {
+  if (!idempotencyReady) {
+    idempotencyStore.init();
+    idempotencyReady = true;
+  }
+  return app.listen(PORT, () => {
+    console.log(`SceneForge backend listening on port ${PORT}`);
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, startServer };
