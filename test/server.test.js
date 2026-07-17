@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const jwt = require("jsonwebtoken");
 const request = require("supertest");
+const Database = require("better-sqlite3");
 
 function setupEnv() {
   process.env.BFL_API_KEY = "test-bfl-key";
@@ -135,30 +136,32 @@ test("invalid idempotency key", async () => {
 
 test("duplicate in-progress request returns GENERATION_IN_PROGRESS", async () => {
   setupEnv();
+  const idempotencyKey = crypto.randomUUID();
+  const db = new Database(process.env.IDEMPOTENCY_DB_PATH);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS generation_requests (
+      user_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      response_json TEXT,
+      error_code TEXT,
+      error_message TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, idempotency_key)
+    );
+  `);
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO generation_requests
+      (user_id, idempotency_key, status, created_at, updated_at, attempt_count)
+     VALUES (?, ?, 'processing', ?, ?, 1)`
+  ).run("user-123", idempotencyKey, now, now);
+  db.close();
+
   const app = loadApp();
   const token = createToken();
-  const idempotencyKey = crypto.randomUUID();
-
-  let release;
-  const hold = new Promise((resolve) => {
-    release = resolve;
-  });
-  global.fetch = async () => {
-    await hold;
-    return {
-      ok: true,
-      json: async () => ({ id: "gen_123", status: "complete", image_url: "https://images.example/a.png" })
-    };
-  };
-
-  const firstRequest = request(app)
-    .post("/api/maps/generate")
-    .set("Authorization", `Bearer ${token}`)
-    .set("Idempotency-Key", idempotencyKey)
-    .send({ prompt: "forest map" });
-
-  await new Promise((resolve) => setTimeout(resolve, 50));
-
   const secondResponse = await request(app)
     .post("/api/maps/generate")
     .set("Authorization", `Bearer ${token}`)
@@ -167,9 +170,6 @@ test("duplicate in-progress request returns GENERATION_IN_PROGRESS", async () =>
 
   assert.equal(secondResponse.status, 409);
   assert.equal(secondResponse.body.error, "GENERATION_IN_PROGRESS");
-
-  release();
-  await firstRequest;
 });
 
 test("duplicate completed request replays original result", async () => {
