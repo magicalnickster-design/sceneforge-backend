@@ -328,3 +328,155 @@ test("No-Origin desktop request succeeds", async () => {
 
   assert.equal(response.status, 200);
 });
+
+test("image proxy requires Gambits bearer token", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app)
+    .post("/api/maps/image/proxy")
+    .send({ imageUrl: "https://delivery.us3.bfl.ai/file.png" });
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "AUTH_REQUIRED");
+});
+
+test("image proxy rejects invalid Gambits token", async () => {
+  setupEnv();
+  const app = loadApp();
+  const invalidToken = jwt.sign({ sub: "user-123", email_verified: true }, "wrong-secret", {
+    algorithm: "HS256",
+    issuer: "gambits",
+    audience: "sceneforge",
+    expiresIn: "15m"
+  });
+  const response = await request(app)
+    .post("/api/maps/image/proxy")
+    .set("Authorization", `Bearer ${invalidToken}`)
+    .send({ imageUrl: "https://delivery.us3.bfl.ai/file.png" });
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "AUTH_REQUIRED");
+});
+
+test("image proxy succeeds with Gambits token and allowed image mime", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  global.fetch = async () => ({
+    ok: true,
+    headers: {
+      get: (name) => {
+        if (String(name).toLowerCase() === "content-type") return "image/png";
+        if (String(name).toLowerCase() === "content-length") return "4";
+        return null;
+      }
+    },
+    arrayBuffer: async () => Buffer.from([1, 2, 3, 4])
+  });
+
+  const response = await request(app)
+    .post("/api/maps/image/proxy")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ imageUrl: "https://delivery.us3.bfl.ai/file.png" });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.contentType, "image/png");
+  assert.equal(typeof response.body.base64, "string");
+  assert.match(response.body.dataUrl, /^data:image\/png;base64,/);
+});
+
+test("image fetch succeeds with Gambits token and allowed image mime", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  global.fetch = async () => ({
+    ok: true,
+    headers: {
+      get: (name) => {
+        if (String(name).toLowerCase() === "content-type") return "image/webp";
+        if (String(name).toLowerCase() === "content-length") return "4";
+        return null;
+      }
+    },
+    arrayBuffer: async () => Buffer.from([1, 2, 3, 4])
+  });
+
+  const response = await request(app)
+    .post("/api/maps/image/fetch")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ imageUrl: "https://delivery.us3.bfl.ai/file.webp" });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, true);
+  assert.equal(response.body.contentType, "image/webp");
+  assert.equal(response.body.extension, "webp");
+  assert.equal(typeof response.body.filename, "string");
+  assert.equal(typeof response.body.base64, "string");
+  assert.match(response.body.dataUrl, /^data:image\/webp;base64,/);
+});
+
+test("image proxy rejects disallowed host", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const response = await request(app)
+    .post("/api/maps/image/proxy")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ imageUrl: "https://example.com/file.png" });
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.error, "invalid_image_url");
+  assert.equal(response.body.reason, "disallowed_image_host");
+});
+
+test("image proxy rejects disallowed content type", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  global.fetch = async () => ({
+    ok: true,
+    headers: {
+      get: (name) => {
+        if (String(name).toLowerCase() === "content-type") return "text/html";
+        if (String(name).toLowerCase() === "content-length") return "4";
+        return null;
+      }
+    },
+    arrayBuffer: async () => Buffer.from([1, 2, 3, 4])
+  });
+
+  const response = await request(app)
+    .post("/api/maps/image/proxy")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ imageUrl: "https://delivery.us3.bfl.ai/file.png" });
+
+  assert.equal(response.status, 415);
+  assert.equal(response.body.error, "generation_failed");
+  assert.equal(response.body.reason, "invalid_image_content_type");
+});
+
+test("image proxy rejects oversized response payload", async () => {
+  setupEnv();
+  process.env.MAX_PROXY_IMAGE_BYTES = "1048576";
+  const app = loadApp();
+  const token = createToken();
+  global.fetch = async () => ({
+    ok: true,
+    headers: {
+      get: (name) => {
+        if (String(name).toLowerCase() === "content-type") return "image/png";
+        if (String(name).toLowerCase() === "content-length") return "2097152";
+        return null;
+      }
+    },
+    arrayBuffer: async () => Buffer.from([1, 2, 3, 4])
+  });
+
+  const response = await request(app)
+    .post("/api/maps/image/proxy")
+    .set("Authorization", `Bearer ${token}`)
+    .send({ imageUrl: "https://delivery.us3.bfl.ai/file.png" });
+
+  assert.equal(response.status, 413);
+  assert.equal(response.body.error, "generation_failed");
+  assert.equal(response.body.reason, "image_too_large");
+});
