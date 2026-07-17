@@ -103,6 +103,13 @@ const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
 const PROVIDER_NAME = "black-forest-labs";
 const MODEL_NAME = "flux-2-flex";
 const ALLOWED_IMAGE_HOST_SUFFIXES = [".bfl.ai"];
+const ALLOWED_IMAGE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/webp",
+  "image/gif"
+]);
 
 const mapLibrary = new Map();
 const rateLimitBuckets = new Map();
@@ -684,6 +691,21 @@ async function fetchImageAsBase64(imageUrl) {
   }
 
   const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const normalizedContentType = contentType.split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(normalizedContentType)) {
+    throw createGenerationError(
+      "invalid_image_content_type",
+      "Image content type is not allowed for proxying.",
+      {
+        status: 415,
+        upstreamStatus: 415,
+        endpoint: imageUrl,
+        upstream: {
+          contentType
+        }
+      }
+    );
+  }
   const contentLengthHeader = response.headers.get("content-length");
   const contentLength = Number(contentLengthHeader || 0);
   if (Number.isFinite(contentLength) && contentLength > MAX_PROXY_IMAGE_BYTES) {
@@ -714,10 +736,10 @@ async function fetchImageAsBase64(imageUrl) {
 
   const base64 = buffer.toString("base64");
   return {
-    contentType,
+    contentType: normalizedContentType,
     bytes: buffer.length,
     base64,
-    dataUrl: `data:${contentType};base64,${base64}`
+    dataUrl: `data:${normalizedContentType};base64,${base64}`
   };
 }
 
@@ -1330,7 +1352,7 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   }
 });
 
-app.post("/api/maps/image/fetch", authorizeSubscriptionToken, async (req, res) => {
+app.post("/api/maps/image/fetch", requireGambitsJwt, async (req, res) => {
   const imageUrl = String(
     req.body?.imageUrl || req.body?.url || req.body?.image_url || req.body?.imagePath || ""
   ).trim();
@@ -1350,12 +1372,8 @@ app.post("/api/maps/image/fetch", authorizeSubscriptionToken, async (req, res) =
   }
 
   try {
-    const entitled = await syncManagedDiscordEntitlement(req, res);
-    if (!entitled) {
-      return;
-    }
     const rateLimit = applyRateLimit({
-      key: getUsageKey(req.auth),
+      key: req.gambitsAuth.userId,
       limit: IMAGE_FETCH_RATE_LIMIT_PER_MIN,
       windowMs: 60 * 1000,
       bucketPrefix: "image-fetch"
@@ -1398,7 +1416,7 @@ app.post("/api/maps/image/fetch", authorizeSubscriptionToken, async (req, res) =
   }
 });
 
-app.post("/api/maps/image/proxy", authorizeSubscriptionToken, async (req, res) => {
+app.post("/api/maps/image/proxy", requireGambitsJwt, async (req, res) => {
   const imageUrl = String(
     req.body?.imageUrl || req.body?.url || req.body?.image_url || req.body?.imagePath || ""
   ).trim();
@@ -1418,12 +1436,8 @@ app.post("/api/maps/image/proxy", authorizeSubscriptionToken, async (req, res) =
   }
 
   try {
-    const entitled = await syncManagedDiscordEntitlement(req, res);
-    if (!entitled) {
-      return;
-    }
     const rateLimit = applyRateLimit({
-      key: getUsageKey(req.auth),
+      key: req.gambitsAuth.userId,
       limit: IMAGE_FETCH_RATE_LIMIT_PER_MIN,
       windowMs: 60 * 1000,
       bucketPrefix: "image-proxy"
