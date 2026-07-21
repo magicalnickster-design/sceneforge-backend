@@ -378,8 +378,50 @@ test("provider retry exhaustion returns clear final error code", async () => {
 
   assert.equal(response.status, 502);
   assert.equal(response.body.error, "GENERATION_FAILED");
-  assert.match(response.body.message, /upstream_503|provider_retry_exhausted/i);
+  assert.equal(response.body.reason, "PROVIDER_UPSTREAM_ERROR");
+  assert.match(response.body.message, /PROVIDER_UPSTREAM_ERROR/i);
   assert.equal(submitCalls, 2);
+});
+
+test("provider timeout returns normalized timeout reason", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  global.fetch = async () => {
+    const err = new Error("timed out");
+    err.name = "AbortError";
+    throw err;
+  };
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "timeout map" });
+
+  assert.equal(response.status, 502);
+  assert.equal(response.body.error, "GENERATION_FAILED");
+  assert.equal(response.body.reason, "PROVIDER_TIMEOUT");
+});
+
+test("provider rate limited maps to normalized rate reason", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  global.fetch = async () => ({
+    ok: false,
+    status: 429,
+    json: async () => ({ error: "rate_limited" }),
+    headers: { get: () => null }
+  });
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "rate map" });
+
+  assert.equal(response.status, 502);
+  assert.equal(response.body.error, "GENERATION_FAILED");
+  assert.equal(response.body.reason, "PROVIDER_RATE_LIMITED");
 });
 
 test("retry then replay with same idempotency key does not duplicate provider calls", async () => {

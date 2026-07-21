@@ -408,6 +408,33 @@ function isRetryableProviderError(error) {
   return status === 502 || status === 503 || status === 504;
 }
 
+function normalizeProviderFailureReason(error) {
+  const reason = String(error?.reason || error?.finalCode || "").toLowerCase();
+  const upstreamStatus = Number(error?.upstreamStatus || error?.status || 0);
+  const detail = String(error?.detail || error?.message || "").toLowerCase();
+  if (reason === "provider_timeout" || reason.includes("timeout") || detail.includes("timed out")) {
+    return "PROVIDER_TIMEOUT";
+  }
+  if (upstreamStatus === 429 || reason === "upstream_429") {
+    return "PROVIDER_RATE_LIMITED";
+  }
+  if (reason === "orientation_mismatch") {
+    return "ORIENTATION_MISMATCH";
+  }
+  if (
+    reason === "provider_response_invalid" ||
+    reason === "provider_dimension_unavailable" ||
+    reason === "invalid_image_content_type" ||
+    reason === "upstream_image_fetch_failed"
+  ) {
+    return "PROVIDER_INVALID_RESPONSE";
+  }
+  if (upstreamStatus >= 500 || reason.startsWith("upstream_")) {
+    return "PROVIDER_UPSTREAM_ERROR";
+  }
+  return "GENERATION_FAILED";
+}
+
 function parseBearerToken(req) {
   const authHeader = req.headers.authorization || "";
   const [scheme, token] = String(authHeader).split(" ");
@@ -1140,8 +1167,11 @@ async function runProviderGenerationWithRetries({
 }) {
   let payload = { ...basePayload };
   let lastError = null;
+  const startedAt = Date.now();
+  let attemptsRan = 0;
 
   for (let attempt = 1; attempt <= PROVIDER_MAX_ATTEMPTS; attempt += 1) {
+    attemptsRan = attempt;
     const attemptStartedAt = Date.now();
     try {
       const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
@@ -1211,7 +1241,9 @@ async function runProviderGenerationWithRetries({
         initialResponse,
         result,
         imageUrl,
-        generationId: extractGenerationId(result) || generationId
+        generationId: extractGenerationId(result) || generationId,
+        attemptsRan,
+        totalDurationMs: Date.now() - startedAt
       };
     } catch (error) {
       lastError = error;
@@ -1267,6 +1299,8 @@ async function runProviderGenerationWithRetries({
       endpoint: BFL_GENERATE_ENDPOINT
     });
   finalError.finalCode = finalError?.reason || "provider_retry_exhausted";
+  finalError.attemptsRan = attemptsRan || PROVIDER_MAX_ATTEMPTS;
+  finalError.totalDurationMs = Date.now() - startedAt;
   throw finalError;
 }
 
@@ -1552,15 +1586,29 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
       "GENERATION_FAILED",
       "Generation failed. Safe retry allowed with the same Idempotency-Key."
     );
-    const finalCode = error?.finalCode || error?.reason || "provider_retry_exhausted";
+    const normalizedReason = normalizeProviderFailureReason(error);
+    const finalCode = error?.finalCode || error?.reason || normalizedReason.toLowerCase();
+    console.error(
+      JSON.stringify({
+        event: "maps_generate_final_failure",
+        idempotencyKey: req.idempotencyKey,
+        normalizedReason,
+        finalCode,
+        providerStatus: Number(error?.upstreamStatus || error?.status || 0) || null,
+        attemptsRan: Number(error?.attemptsRan || 0) || null,
+        totalDurationMs: Number(error?.totalDurationMs || 0) || null,
+        detail: error?.detail || error?.message || "Generation failed."
+      })
+    );
     return res
       .status(502)
-      .json(
-        normalizeGenerateError(
+      .json({
+        ...normalizeGenerateError(
           "GENERATION_FAILED",
-          `Generation failed (${finalCode}). Retry with the same Idempotency-Key.`
-        )
-      );
+          `Generation failed (${normalizedReason}). Retry with the same Idempotency-Key.`
+        ),
+        reason: normalizedReason
+      });
   }
 });
 
