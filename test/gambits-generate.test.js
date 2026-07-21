@@ -583,6 +583,60 @@ test("Forge-style CORS preflight is allowed", async () => {
   assert.match(response.headers["access-control-allow-headers"], /idempotency-key/i);
 });
 
+test("Forge-style CORS preflight works for cache route", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app)
+    .options("/api/maps/reuse/exact")
+    .set("Origin", "https://ytgambit-monday-night-dnd.forge-vtt.com")
+    .set("Access-Control-Request-Method", "POST")
+    .set("Access-Control-Request-Headers", "authorization,content-type,idempotency-key");
+
+  assert.equal(response.status, 204);
+  assert.equal(
+    response.headers["access-control-allow-origin"],
+    "https://ytgambit-monday-night-dnd.forge-vtt.com"
+  );
+  assert.match(response.headers["access-control-allow-methods"], /POST/);
+});
+
+test("Forge-hosted authenticated POST includes CORS headers", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  setFetchSuccess("https://delivery.us3.bfl.ai/cors-post.png");
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Origin", "https://ytgambit-monday-night-dnd.forge-vtt.com")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "cors authenticated map" });
+
+  assert.equal(response.status, 200);
+  assert.equal(
+    response.headers["access-control-allow-origin"],
+    "https://ytgambit-monday-night-dnd.forge-vtt.com"
+  );
+});
+
+test("error response still includes CORS headers", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Origin", "https://ytgambit-monday-night-dnd.forge-vtt.com")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "" });
+
+  assert.equal(response.status, 400);
+  assert.equal(
+    response.headers["access-control-allow-origin"],
+    "https://ytgambit-monday-night-dnd.forge-vtt.com"
+  );
+});
+
 test("No-Origin desktop request succeeds", async () => {
   setupEnv();
   const app = loadApp();
@@ -595,6 +649,22 @@ test("No-Origin desktop request succeeds", async () => {
     .send({ prompt: "desktop map" });
 
   assert.equal(response.status, 200);
+});
+
+test("unauthorized request still includes CORS headers", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Origin", "https://ytgambit-monday-night-dnd.forge-vtt.com")
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "no auth map" });
+
+  assert.equal(response.status, 401);
+  assert.equal(
+    response.headers["access-control-allow-origin"],
+    "https://ytgambit-monday-night-dnd.forge-vtt.com"
+  );
 });
 
 test("image proxy requires Gambits bearer token", async () => {

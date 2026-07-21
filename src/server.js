@@ -1,5 +1,4 @@
 const express = require("express");
-const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
 const crypto = require("crypto");
@@ -103,6 +102,7 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set([
 
 const mapLibrary = new Map();
 const rateLimitBuckets = new Map();
+const ALLOWED_CORS_HEADERS = ["Authorization", "Content-Type", "Idempotency-Key"];
 const tokenStore = new TokenStore({
   dbPath: DB_PATH,
   tokenPepper: TOKEN_SIGNING_PEPPER
@@ -119,28 +119,53 @@ try {
 }
 
 const app = express();
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin) {
-        return callback(null, true);
-      }
-      try {
-        const parsed = new URL(origin);
-        if (parsed.protocol === "http:" && parsed.hostname === "localhost") {
-          return callback(null, true);
-        }
-        if (parsed.protocol === "https:") {
-          return callback(null, true);
-        }
-      } catch {
-        return callback(new Error("Not allowed by CORS"));
-      }
-      return callback(new Error("Not allowed by CORS"));
-    },
-    allowedHeaders: ["Authorization", "Content-Type", "Idempotency-Key"]
-  })
-);
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
+  try {
+    const parsed = new URL(origin);
+    const hostname = String(parsed.hostname || "").toLowerCase();
+    if (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      ["localhost", "127.0.0.1", "::1"].includes(hostname)
+    ) {
+      return true;
+    }
+    if (parsed.protocol === "https:") {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowed = isAllowedCorsOrigin(origin);
+
+  if (!origin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (allowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", ALLOWED_CORS_HEADERS.join(", "));
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  if (origin && !allowed) {
+    return res.status(403).json({
+      error: "forbidden_origin",
+      message: "Origin is not allowed."
+    });
+  }
+  return next();
+});
 app.use(express.json({ limit: "2mb" }));
 
 const authorizeSubscriptionToken = createSubscriptionAuthorizer({
