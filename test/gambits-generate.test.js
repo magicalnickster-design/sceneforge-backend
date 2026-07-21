@@ -39,7 +39,7 @@ function createToken(overrides = {}, options = {}) {
   });
 }
 
-function setFetchSuccess(imageUrl = "https://images.example/result.png") {
+function setFetchSuccess(imageUrl = "https://delivery.us3.bfl.ai/result.png") {
   global.fetch = async (url) => {
     if (String(url).includes("flux-2-flex")) {
       return {
@@ -52,7 +52,7 @@ function setFetchSuccess(imageUrl = "https://images.example/result.png") {
     }
     return {
       ok: true,
-      json: async () => ({ id: "gen_123", status: "complete", image_url: imageUrl }),
+      json: async () => ({ id: "gen_123", status: "complete", image_url: imageUrl, width: 1024, height: 1024 }),
       headers: {
         get: () => null
       }
@@ -198,7 +198,13 @@ test("duplicate completed request replays original result", async () => {
     }
     return {
       ok: true,
-      json: async () => ({ id: "gen_123", status: "complete", image_url: "https://images.example/a.png" }),
+      json: async () => ({
+        id: "gen_123",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/a.png",
+        width: 1024,
+        height: 1024
+      }),
       headers: {
         get: () => null
       }
@@ -278,7 +284,7 @@ test("successful generation preserves response shape", async () => {
   setupEnv();
   const app = loadApp();
   const token = createToken();
-  setFetchSuccess("https://images.example/success.png");
+  setFetchSuccess("https://delivery.us3.bfl.ai/success.png");
   const response = await request(app)
     .post("/api/maps/generate")
     .set("Authorization", `Bearer ${token}`)
@@ -298,7 +304,269 @@ test("successful generation preserves response shape", async () => {
     "provider",
     "url"
   ]);
-  assert.equal(response.body.imagePath, "https://images.example/success.png");
+  assert.equal(response.body.imagePath, "https://delivery.us3.bfl.ai/success.png");
+});
+
+test("provider 502 on first attempt retries and succeeds", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  let submitCalls = 0;
+
+  global.fetch = async (url) => {
+    if (String(url).includes("flux-2-flex")) {
+      submitCalls += 1;
+      if (submitCalls === 1) {
+        return {
+          ok: false,
+          status: 502,
+          json: async () => ({ error: "upstream bad gateway" }),
+          headers: { get: () => null }
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_abc", polling_url: "https://polling.example/retry-success" }),
+        headers: { get: () => null }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_abc",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/retry-success.png",
+        width: 1024,
+        height: 1024
+      }),
+      headers: { get: () => null }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "forest map" });
+
+  assert.equal(response.status, 200);
+  assert.equal(submitCalls, 2);
+});
+
+test("provider retry exhaustion returns clear final error code", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  let submitCalls = 0;
+  global.fetch = async (url) => {
+    if (String(url).includes("flux-2-flex")) {
+      submitCalls += 1;
+    }
+    return {
+      ok: false,
+      status: 503,
+      json: async () => ({ error: "temporarily unavailable" }),
+      headers: { get: () => null }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "forest map" });
+
+  assert.equal(response.status, 502);
+  assert.equal(response.body.error, "GENERATION_FAILED");
+  assert.match(response.body.message, /upstream_503|provider_retry_exhausted/i);
+  assert.equal(submitCalls, 2);
+});
+
+test("retry then replay with same idempotency key does not duplicate provider calls", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const idempotencyKey = crypto.randomUUID();
+  let submitCalls = 0;
+
+  global.fetch = async (url) => {
+    if (String(url).includes("flux-2-flex")) {
+      submitCalls += 1;
+      if (submitCalls === 1) {
+        return {
+          ok: false,
+          status: 502,
+          json: async () => ({ error: "upstream bad gateway" }),
+          headers: { get: () => null }
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_once", polling_url: "https://polling.example/gen-once" }),
+        headers: { get: () => null }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_once",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/gen-once.png",
+        width: 1024,
+        height: 1024
+      }),
+      headers: { get: () => null }
+    };
+  };
+
+  const first = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", idempotencyKey)
+    .send({ prompt: "forest map" });
+  const replay = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", idempotencyKey)
+    .send({ prompt: "forest map" });
+
+  assert.equal(first.status, 200);
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, first.body);
+  assert.equal(submitCalls, 2);
+});
+
+test("portrait request enforces portrait dimensions in provider request", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  let submitBody = null;
+
+  global.fetch = async (url, options = {}) => {
+    if (String(url).includes("flux-2-flex")) {
+      submitBody = JSON.parse(String(options.body || "{}"));
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_portrait", polling_url: "https://polling.example/portrait" }),
+        headers: { get: () => null }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_portrait",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/portrait.png",
+        width: 768,
+        height: 1024
+      }),
+      headers: { get: () => null }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "portrait map", imageOrientation: "portrait", width: 1024, height: 768 });
+
+  assert.equal(response.status, 200);
+  assert.ok(submitBody.width < submitBody.height);
+});
+
+test("landscape request enforces landscape dimensions in provider request", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  let submitBody = null;
+
+  global.fetch = async (url, options = {}) => {
+    if (String(url).includes("flux-2-flex")) {
+      submitBody = JSON.parse(String(options.body || "{}"));
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_landscape", polling_url: "https://polling.example/landscape" }),
+        headers: { get: () => null }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_landscape",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/landscape.png",
+        width: 1200,
+        height: 800
+      }),
+      headers: { get: () => null }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "landscape map", imageOrientation: "landscape", width: 800, height: 1200 });
+
+  assert.equal(response.status, 200);
+  assert.ok(submitBody.width > submitBody.height);
+});
+
+test("wrong provider orientation retries once with stronger prompt", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const submitPayloads = [];
+
+  global.fetch = async (url, options = {}) => {
+    if (String(url).includes("flux-2-flex")) {
+      submitPayloads.push(JSON.parse(String(options.body || "{}")));
+      const attempt = submitPayloads.length;
+      return {
+        ok: true,
+        json: async () => ({
+          id: `gen_attempt_${attempt}`,
+          polling_url: `https://polling.example/orientation-${attempt}`
+        }),
+        headers: { get: () => null }
+      };
+    }
+    if (String(url).includes("orientation-1")) {
+      return {
+        ok: true,
+        json: async () => ({
+          id: "gen_attempt_1",
+          status: "complete",
+          image_url: "https://delivery.us3.bfl.ai/attempt1.png",
+          width: 1200,
+          height: 800
+        }),
+        headers: { get: () => null }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_attempt_2",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/attempt2.png",
+        width: 800,
+        height: 1200
+      }),
+      headers: { get: () => null }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "portrait castle", imageOrientation: "portrait", width: 1024, height: 768 });
+
+  assert.equal(response.status, 200);
+  assert.equal(submitPayloads.length, 2);
+  assert.match(submitPayloads[1].prompt, /CRITICAL/i);
+  assert.ok(submitPayloads[1].width < submitPayloads[1].height);
 });
 
 test("Forge-style CORS preflight is allowed", async () => {
@@ -479,4 +747,22 @@ test("image proxy rejects oversized response payload", async () => {
   assert.equal(response.status, 413);
   assert.equal(response.body.error, "generation_failed");
   assert.equal(response.body.reason, "image_too_large");
+});
+
+test("malformed cache lookup does not fail generation flow", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app).post("/api/maps/reuse/exact").send({});
+  assert.equal(response.status, 200);
+  assert.equal(response.body.found, false);
+  assert.equal(response.body.skipped, true);
+});
+
+test("malformed library upsert is non-blocking when strict contract disabled", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app).post("/api/maps/library/upsert").send({});
+  assert.equal(response.status, 200);
+  assert.equal(response.body.ok, false);
+  assert.equal(response.body.skipped, true);
 });

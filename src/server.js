@@ -88,6 +88,10 @@ const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
 const PROVIDER_NAME = "black-forest-labs";
 const MODEL_NAME = "flux-2-flex";
+const PROVIDER_MAX_ATTEMPTS = 2;
+const PROVIDER_RETRY_BASE_MS = Math.max(100, Number(process.env.PROVIDER_RETRY_BASE_MS || 500));
+const PROVIDER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROVIDER_TIMEOUT_MS || 45000));
+const STRICT_CACHE_CONTRACT = String(process.env.STRICT_CACHE_CONTRACT || "false").toLowerCase() === "true";
 const ALLOWED_IMAGE_HOST_SUFFIXES = [".bfl.ai"];
 const ALLOWED_IMAGE_MIME_TYPES = new Set([
   "image/png",
@@ -176,6 +180,207 @@ function applyRateLimit({ key, limit, windowMs, bucketPrefix }) {
   existing.count += 1;
   rateLimitBuckets.set(bucketKey, existing);
   return { allowed: true };
+}
+
+function parseImageSize(rawSize) {
+  const match = String(rawSize || "")
+    .trim()
+    .match(/^(\d+)\s*x\s*(\d+)$/i);
+  if (!match) {
+    return null;
+  }
+  return {
+    width: Number(match[1]),
+    height: Number(match[2])
+  };
+}
+
+function normalizeOrientation(rawOrientation) {
+  const normalized = String(rawOrientation || "").trim().toLowerCase();
+  if (["portrait", "landscape", "square"].includes(normalized)) {
+    return normalized;
+  }
+  return "";
+}
+
+function normalizeDimensions({ width, height, imageSize, orientation }) {
+  const imageSizeDimensions = parseImageSize(imageSize);
+  let nextWidth = Number(width) || imageSizeDimensions?.width || 1024;
+  let nextHeight = Number(height) || imageSizeDimensions?.height || 1024;
+  const normalizedOrientation = normalizeOrientation(orientation);
+
+  if (normalizedOrientation === "portrait") {
+    if (nextWidth >= nextHeight) {
+      const shortSide = Math.min(nextWidth, nextHeight);
+      const longSide = Math.max(nextWidth, nextHeight);
+      nextWidth = shortSide;
+      nextHeight = longSide === shortSide ? shortSide + 1 : longSide;
+    }
+  } else if (normalizedOrientation === "landscape") {
+    if (nextWidth <= nextHeight) {
+      const shortSide = Math.min(nextWidth, nextHeight);
+      const longSide = Math.max(nextWidth, nextHeight);
+      nextWidth = longSide === shortSide ? longSide + 1 : longSide;
+      nextHeight = shortSide;
+    }
+  } else if (normalizedOrientation === "square") {
+    const side = Math.max(nextWidth, nextHeight);
+    nextWidth = side;
+    nextHeight = side;
+  }
+
+  return {
+    width: Math.max(256, Math.floor(nextWidth)),
+    height: Math.max(256, Math.floor(nextHeight)),
+    orientation: normalizedOrientation
+  };
+}
+
+function orientationMatches(orientation, width, height) {
+  if (!orientation) {
+    return true;
+  }
+  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    return false;
+  }
+  if (orientation === "portrait") {
+    return height > width;
+  }
+  if (orientation === "landscape") {
+    return width > height;
+  }
+  if (orientation === "square") {
+    return width === height;
+  }
+  return true;
+}
+
+function applyOrientationPrompt(prompt, orientation, strengthen = false) {
+  if (!orientation) {
+    return prompt;
+  }
+  const baseInstruction =
+    orientation === "portrait"
+      ? "Output must be portrait orientation (height greater than width)."
+      : orientation === "landscape"
+        ? "Output must be landscape orientation (width greater than height)."
+        : "Output must be square orientation (equal width and height).";
+  const strongerInstruction = strengthen
+    ? ` CRITICAL: Strictly enforce ${orientation} orientation. Reject wrong orientation.`
+    : "";
+  return `${String(prompt || "").trim()} ${baseInstruction}${strongerInstruction}`.trim();
+}
+
+function extractProviderDimensions(payload) {
+  const candidates = [
+    payload?.width && payload?.height ? { width: payload.width, height: payload.height } : null,
+    payload?.result?.width && payload?.result?.height
+      ? { width: payload.result.width, height: payload.result.height }
+      : null,
+    payload?.result?.image?.width && payload?.result?.image?.height
+      ? { width: payload.result.image.width, height: payload.result.image.height }
+      : null
+  ].filter(Boolean);
+
+  if (Array.isArray(payload?.result?.images) && payload.result.images[0]) {
+    const first = payload.result.images[0];
+    if (first?.width && first?.height) {
+      candidates.push({ width: first.width, height: first.height });
+    }
+  }
+
+  if (Array.isArray(payload?.images) && payload.images[0]) {
+    const first = payload.images[0];
+    if (first?.width && first?.height) {
+      candidates.push({ width: first.width, height: first.height });
+    }
+  }
+
+  for (const candidate of candidates) {
+    const width = Number(candidate.width);
+    const height = Number(candidate.height);
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      return {
+        width: Math.floor(width),
+        height: Math.floor(height),
+        source: "provider-payload"
+      };
+    }
+  }
+
+  return null;
+}
+
+function parseImageDimensionsFromBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 24) {
+    return null;
+  }
+
+  // PNG
+  if (buffer.readUInt32BE(0) === 0x89504e47 && buffer.toString("ascii", 12, 16) === "IHDR") {
+    return {
+      width: buffer.readUInt32BE(16),
+      height: buffer.readUInt32BE(20),
+      source: "png-bytes"
+    };
+  }
+
+  // GIF
+  if (buffer.toString("ascii", 0, 3) === "GIF") {
+    return {
+      width: buffer.readUInt16LE(6),
+      height: buffer.readUInt16LE(8),
+      source: "gif-bytes"
+    };
+  }
+
+  // JPEG
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      const size = buffer.readUInt16BE(offset + 2);
+      if (
+        marker >= 0xc0 &&
+        marker <= 0xcf &&
+        ![0xc4, 0xc8, 0xcc].includes(marker) &&
+        offset + 8 < buffer.length
+      ) {
+        return {
+          width: buffer.readUInt16BE(offset + 7),
+          height: buffer.readUInt16BE(offset + 5),
+          source: "jpeg-bytes"
+        };
+      }
+      if (!size || size < 2) {
+        break;
+      }
+      offset += size + 2;
+    }
+  }
+
+  // WEBP (VP8X)
+  if (buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+    if (buffer.toString("ascii", 12, 16) === "VP8X" && buffer.length >= 30) {
+      const width = 1 + buffer.readUIntLE(24, 3);
+      const height = 1 + buffer.readUIntLE(27, 3);
+      return { width, height, source: "webp-bytes" };
+    }
+  }
+
+  return null;
+}
+
+function isRetryableProviderError(error) {
+  const status = Number(error?.upstreamStatus || error?.status || 0);
+  if (!status) {
+    return true;
+  }
+  return status === 502 || status === 503 || status === 504;
 }
 
 function parseBearerToken(req) {
@@ -394,7 +599,37 @@ function sleep(ms) {
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+  const { timeoutMs = PROVIDER_TIMEOUT_MS, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeoutHandle =
+    timeoutMs > 0
+      ? setTimeout(() => {
+        controller.abort();
+      }, timeoutMs)
+      : null;
+  let response;
+  try {
+    response = await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal
+    });
+  } catch (cause) {
+    const error = new Error(cause?.message || "Provider request failed.");
+    error.status = cause?.name === "AbortError" ? 504 : 503;
+    error.detail =
+      cause?.name === "AbortError"
+        ? `Provider request timed out after ${timeoutMs}ms.`
+        : cause?.message || "Provider request failed.";
+    error.endpoint = url;
+    error.requestId = null;
+    error.details = null;
+    error.isNetworkError = true;
+    throw error;
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
   const requestId =
     response.headers.get("x-request-id") ||
     response.headers.get("request-id") ||
@@ -674,6 +909,84 @@ async function fetchImageAsBase64(imageUrl) {
   };
 }
 
+async function fetchImageDimensions(imageUrl) {
+  if (!isAllowedImageUrl(imageUrl)) {
+    throw createGenerationError(
+      "disallowed_image_host",
+      "Generated image host is not allowed for verification.",
+      {
+        status: 400,
+        upstreamStatus: 400,
+        endpoint: imageUrl
+      }
+    );
+  }
+  const response = await fetch(imageUrl, {
+    method: "GET",
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+  });
+  if (!response.ok) {
+    throw createGenerationError(
+      "upstream_image_fetch_failed",
+      `Image dimension fetch failed with status ${response.status}.`,
+      {
+        status: response.status,
+        upstreamStatus: response.status,
+        endpoint: imageUrl,
+        requestId:
+          response.headers.get("x-request-id") ||
+          response.headers.get("request-id") ||
+          response.headers.get("cf-ray") ||
+          null
+      }
+    );
+  }
+  const contentType = String(response.headers.get("content-type") || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(contentType)) {
+    throw createGenerationError(
+      "invalid_image_content_type",
+      "Generated image content type is not allowed.",
+      {
+        status: 415,
+        upstreamStatus: 415,
+        endpoint: imageUrl,
+        upstream: { contentType }
+      }
+    );
+  }
+
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_PROXY_IMAGE_BYTES) {
+    throw createGenerationError(
+      "image_too_large",
+      `Generated image exceeds max verification size of ${MAX_PROXY_IMAGE_BYTES} bytes.`,
+      {
+        status: 413,
+        upstreamStatus: 413,
+        endpoint: imageUrl
+      }
+    );
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const parsed = parseImageDimensionsFromBuffer(buffer);
+  if (!parsed?.width || !parsed?.height) {
+    throw createGenerationError(
+      "provider_dimension_unavailable",
+      "Unable to verify generated image dimensions.",
+      {
+        status: 502,
+        upstreamStatus: 502,
+        endpoint: imageUrl
+      }
+    );
+  }
+  return parsed;
+}
+
 function selectImageUrl(resultPayload) {
   const candidates = [
     resultPayload?.image_url,
@@ -792,6 +1105,144 @@ async function pollBflResult(initialPayload, generationId = null) {
       }
     }
   );
+}
+
+async function runProviderGenerationWithRetries({
+  idempotencyKey,
+  requestedOrientation,
+  requestedDimensions,
+  basePayload
+}) {
+  let payload = { ...basePayload };
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= PROVIDER_MAX_ATTEMPTS; attempt += 1) {
+    const attemptStartedAt = Date.now();
+    try {
+      const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-key": BFL_API_KEY,
+          Authorization: `Bearer ${BFL_API_KEY}`
+        },
+        body: JSON.stringify(payload),
+        timeoutMs: PROVIDER_TIMEOUT_MS
+      });
+      const generationId = extractGenerationId(initialResponse);
+      const result = await pollBflResult(initialResponse, generationId);
+      const imageUrl = selectImageUrl(result);
+      if (!imageUrl) {
+        throw createGenerationError("provider_response_invalid", "No image URL returned by BFL.", {
+          status: 502,
+          upstreamStatus: 502,
+          generationId: extractGenerationId(result) || generationId,
+          endpoint: BFL_RESULT_ENDPOINT,
+          upstream: result
+        });
+      }
+
+      const providerDimensions =
+        extractProviderDimensions(result) ||
+        extractProviderDimensions(initialResponse) ||
+        (await fetchImageDimensions(imageUrl));
+      const orientationValid = orientationMatches(
+        requestedOrientation,
+        providerDimensions?.width,
+        providerDimensions?.height
+      );
+
+      console.info(
+        JSON.stringify({
+          event: "maps_generate_orientation_check",
+          attempt,
+          requestedOrientation: requestedOrientation || null,
+          requestedDimensions,
+          providerDimensions,
+          finalDimensions: providerDimensions,
+          idempotencyKey
+        })
+      );
+
+      if (!orientationValid) {
+        throw createGenerationError(
+          "orientation_mismatch",
+          `Provider returned ${providerDimensions.width}x${providerDimensions.height}, which does not match requested ${requestedOrientation} orientation.`,
+          {
+            status: 422,
+            upstreamStatus: 422,
+            generationId: extractGenerationId(result) || generationId,
+            endpoint: BFL_RESULT_ENDPOINT,
+            upstream: {
+              requestedOrientation,
+              requestedDimensions,
+              providerDimensions
+            }
+          }
+        );
+      }
+
+      return {
+        initialResponse,
+        result,
+        imageUrl,
+        generationId: extractGenerationId(result) || generationId
+      };
+    } catch (error) {
+      lastError = error;
+      const retryable = isRetryableProviderError(error) || error?.reason === "orientation_mismatch";
+      const canRetry = attempt < PROVIDER_MAX_ATTEMPTS && retryable;
+
+      console.error(
+        JSON.stringify({
+          event: "maps_generate_provider_attempt_failed",
+          attempt,
+          maxAttempts: PROVIDER_MAX_ATTEMPTS,
+          retryable,
+          canRetry,
+          idempotencyKey,
+          requestedOrientation: requestedOrientation || null,
+          requestedDimensions,
+          providerStatus: Number(error?.upstreamStatus || error?.status || 0) || null,
+          reason: error?.reason || classifyGenerationReason(error),
+          detail: error?.detail || error?.message || "Provider request failed.",
+          endpoint: error?.endpoint || BFL_GENERATE_ENDPOINT,
+          elapsedMs: Date.now() - attemptStartedAt
+        })
+      );
+
+      if (!canRetry) {
+        break;
+      }
+
+      if (error?.reason === "orientation_mismatch") {
+        const corrected = normalizeDimensions({
+          width: requestedDimensions.width,
+          height: requestedDimensions.height,
+          orientation: requestedOrientation
+        });
+        payload = {
+          ...basePayload,
+          width: corrected.width,
+          height: corrected.height,
+          prompt: applyOrientationPrompt(basePayload.prompt, requestedOrientation, true)
+        };
+      }
+
+      const backoffMs = PROVIDER_RETRY_BASE_MS * 2 ** (attempt - 1);
+      await sleep(backoffMs);
+    }
+  }
+
+  const finalError =
+    lastError ||
+    createGenerationError("provider_retry_exhausted", "Provider retries were exhausted.", {
+      status: 502,
+      upstreamStatus: 502,
+      endpoint: BFL_GENERATE_ENDPOINT
+    });
+  finalError.finalCode = finalError?.reason || "provider_retry_exhausted";
+  throw finalError;
 }
 
 app.get("/health", (_req, res) => {
@@ -940,6 +1391,13 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
 
   const prompt = String(req.body?.prompt || "").trim();
   const imageCount = Math.max(1, Number(req.body?.imageCount || DEFAULT_IMAGE_COUNT));
+  const requestedOrientation = normalizeOrientation(req.body?.imageOrientation || req.body?.orientation);
+  const requestedDimensions = normalizeDimensions({
+    width: req.body?.width,
+    height: req.body?.height,
+    imageSize: req.body?.imageSize,
+    orientation: requestedOrientation
+  });
   const rawSeed = req.body?.seed;
   let normalizedSeed;
   if (rawSeed !== undefined && rawSeed !== null && String(rawSeed).trim() !== "") {
@@ -963,9 +1421,9 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   }
 
   const payload = {
-    prompt,
-    width: Number(req.body?.width) || 1024,
-    height: Number(req.body?.height) || 1024,
+    prompt: applyOrientationPrompt(prompt, requestedOrientation, false),
+    width: requestedDimensions.width,
+    height: requestedDimensions.height,
     num_images: imageCount,
     safety_tolerance: Number(req.body?.safety_tolerance || 2),
     output_format: req.body?.output_format || "png",
@@ -1018,30 +1476,18 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   }
 
   try {
-    const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-key": BFL_API_KEY,
-        Authorization: `Bearer ${BFL_API_KEY}`
+    const providerResult = await runProviderGenerationWithRetries({
+      idempotencyKey: req.idempotencyKey,
+      requestedOrientation,
+      requestedDimensions: {
+        width: requestedDimensions.width,
+        height: requestedDimensions.height
       },
-      body: JSON.stringify(payload)
+      basePayload: payload
     });
-    const generationId = extractGenerationId(initialResponse);
-
-    const result = await pollBflResult(initialResponse, generationId);
-    const imageUrl = selectImageUrl(result);
-
-    if (!imageUrl) {
-      throw createGenerationError("provider_response_invalid", "No image URL returned by BFL.", {
-        status: 502,
-        upstreamStatus: 502,
-        generationId: extractGenerationId(result) || generationId,
-        endpoint: BFL_RESULT_ENDPOINT,
-        upstream: result
-      });
-    }
-    const finalGenerationId = extractGenerationId(result) || generationId;
+    const imageUrl = providerResult.imageUrl;
+    const finalGenerationId = providerResult.generationId;
+    const providerPayload = providerResult.result || {};
     const responsePayload = {
       imagePath: imageUrl,
       image_url: imageUrl,
@@ -1050,7 +1496,11 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
       model: MODEL_NAME,
       endpoint: BFL_GENERATE_ENDPOINT,
       estimatedCost:
-        Number(result?.cost ?? result?.result?.cost ?? imageCount * ESTIMATED_COST_PER_IMAGE) || 0,
+        Number(
+          providerPayload?.cost ??
+          providerPayload?.result?.cost ??
+          imageCount * ESTIMATED_COST_PER_IMAGE
+        ) || 0,
       generationId: finalGenerationId,
       imageCount,
       metadata: {
@@ -1058,7 +1508,11 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
         model: MODEL_NAME,
         endpoint: BFL_GENERATE_ENDPOINT,
         estimatedCost:
-          Number(result?.cost ?? result?.result?.cost ?? imageCount * ESTIMATED_COST_PER_IMAGE) || 0,
+          Number(
+            providerPayload?.cost ??
+            providerPayload?.result?.cost ??
+            imageCount * ESTIMATED_COST_PER_IMAGE
+          ) || 0,
         generationId: finalGenerationId,
         imageCount
       }
@@ -1073,12 +1527,13 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
       "GENERATION_FAILED",
       "Generation failed. Safe retry allowed with the same Idempotency-Key."
     );
+    const finalCode = error?.finalCode || error?.reason || "provider_retry_exhausted";
     return res
       .status(502)
       .json(
         normalizeGenerateError(
           "GENERATION_FAILED",
-          "Generation failed. Retry with the same Idempotency-Key."
+          `Generation failed (${finalCode}). Retry with the same Idempotency-Key.`
         )
       );
   }
@@ -1212,6 +1667,15 @@ app.post("/api/maps/image/proxy", requireGambitsJwt, async (req, res) => {
 app.post("/api/maps/reuse/exact", (req, res) => {
   const key = String(req.body?.key || req.body?.mapKey || req.body?.fingerprint || "").trim();
   if (!key) {
+    if (!STRICT_CACHE_CONTRACT) {
+      return res.json({
+        found: false,
+        key: null,
+        map: null,
+        skipped: true,
+        reason: "missing_key"
+      });
+    }
     return res.status(400).json({
       error: "missing_key",
       message: "Provide key, mapKey, or fingerprint."
@@ -1229,6 +1693,14 @@ app.post("/api/maps/library/upsert", (req, res) => {
   const key = String(req.body?.key || req.body?.mapKey || req.body?.fingerprint || "").trim();
   const imageUrl = String(req.body?.image_url || req.body?.url || req.body?.imagePath || "").trim();
   if (!key || !imageUrl) {
+    if (!STRICT_CACHE_CONTRACT) {
+      return res.json({
+        ok: false,
+        skipped: true,
+        reason: "invalid_payload",
+        message: "Fields key/mapKey/fingerprint and image_url/url/imagePath are required."
+      });
+    }
     return res.status(400).json({
       error: "invalid_payload",
       message: "Fields key/mapKey/fingerprint and image_url/url/imagePath are required."
