@@ -92,6 +92,18 @@ const PROVIDER_RETRY_BASE_MS = Math.max(100, Number(process.env.PROVIDER_RETRY_B
 const PROVIDER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROVIDER_TIMEOUT_MS || 45000));
 const STRICT_CACHE_CONTRACT = String(process.env.STRICT_CACHE_CONTRACT || "false").toLowerCase() === "true";
 const ALLOWED_IMAGE_HOST_SUFFIXES = [".bfl.ai"];
+const BFL_IMAGE_INPUT_FIELD_NAMES = new Set([
+  "image",
+  "input_image",
+  "init_image",
+  "image_url",
+  "imageurl",
+  "referenceimage",
+  "control_image",
+  "mask",
+  "base64",
+  "base64_image"
+]);
 const ALLOWED_IMAGE_MIME_TYPES = new Set([
   "image/png",
   "image/jpeg",
@@ -406,6 +418,60 @@ function isRetryableProviderError(error) {
     return true;
   }
   return status === 502 || status === 503 || status === 504;
+}
+
+function isImageLikeFieldName(key) {
+  const normalized = String(key || "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (BFL_IMAGE_INPUT_FIELD_NAMES.has(normalized)) {
+    return true;
+  }
+  return normalized.includes("image") || normalized.includes("mask");
+}
+
+function sanitizeProviderPayloadForTextToImage(payload) {
+  const next = { ...payload };
+  const removedImageFields = [];
+  for (const key of Object.keys(next)) {
+    if (!isImageLikeFieldName(key)) {
+      continue;
+    }
+    removedImageFields.push(key);
+    delete next[key];
+  }
+  return {
+    payload: next,
+    removedImageFields
+  };
+}
+
+function logProviderRequestSchema({
+  endpoint,
+  method,
+  model,
+  payload,
+  orientation,
+  attempt
+}) {
+  const keys = Object.keys(payload || {});
+  const imageFieldNames = keys.filter((key) => isImageLikeFieldName(key));
+  console.info(
+    JSON.stringify({
+      event: "maps_generate_provider_request_schema",
+      endpoint,
+      method,
+      model,
+      attempt,
+      topLevelFieldNames: keys,
+      hasImageField: imageFieldNames.length > 0,
+      imageFieldNames,
+      width: Number(payload?.width) || null,
+      height: Number(payload?.height) || null,
+      orientation: orientation || null
+    })
+  );
 }
 
 function normalizeProviderFailureReason(error) {
@@ -1174,6 +1240,26 @@ async function runProviderGenerationWithRetries({
     attemptsRan = attempt;
     const attemptStartedAt = Date.now();
     try {
+      const sanitized = sanitizeProviderPayloadForTextToImage(payload);
+      payload = sanitized.payload;
+      if (sanitized.removedImageFields.length > 0) {
+        console.warn(
+          JSON.stringify({
+            event: "maps_generate_removed_image_fields",
+            removedImageFieldNames: sanitized.removedImageFields,
+            attempt,
+            endpoint: BFL_GENERATE_ENDPOINT
+          })
+        );
+      }
+      logProviderRequestSchema({
+        endpoint: BFL_GENERATE_ENDPOINT,
+        method: "POST",
+        model: MODEL_NAME,
+        payload,
+        orientation: requestedOrientation,
+        attempt
+      });
       const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
         method: "POST",
         headers: {
