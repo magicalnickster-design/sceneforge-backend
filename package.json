@@ -10,7 +10,8 @@
     "init-storage": "node scripts/init-storage.js",
     "validate:generate": "node scripts/validate-generate.js",
     "validate:image-fetch": "node scripts/validate-image-fetch.js",
-    "test": "node --test"
+    "test": "node --test",
+    "test:lootforge": "node --test lootforge/test/*.test.js"
   },
   "engines": {
     "node": ">=18"

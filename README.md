@@ -2,6 +2,10 @@
 
 SceneForge backend for subscription-gated map generation with BFL FLUX.2 Flex and Discord OAuth linking.
 
+## LootForge (Foundry module)
+
+The Foundry VTT **LootForge** prototype lives in [`lootforge/`](./lootforge/). It is a client-side D&D 5e module (wolf harvesting) and is not part of this Express API. See [`lootforge/README.md`](./lootforge/README.md) for install and test steps.
+
 ## Architecture (text diagram)
 
 1. User clicks "Link Discord" in module

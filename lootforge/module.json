@@ -1,0 +1,45 @@
+{
+  "id": "lootforge",
+  "title": "LootForge",
+  "description": "Interactive looting and harvesting for defeated creatures. Gambits Forge prototype.",
+  "version": "0.1.0",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "13"
+  },
+  "authors": [
+    {
+      "name": "Gambits Forge"
+    }
+  ],
+  "relationships": {
+    "systems": [
+      {
+        "id": "dnd5e",
+        "type": "system",
+        "compatibility": {
+          "minimum": "3.0.0"
+        }
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "styles": [
+    "styles/lootforge.css"
+  ],
+  "languages": [
+    {
+      "lang": "en",
+      "name": "English",
+      "path": "lang/en.json"
+    }
+  ],
+  "socket": true,
+  "url": "https://github.com/magicalnickster-design/sceneforge-backend",
+  "manifest": "",
+  "download": "",
+  "license": "MIT",
+  "readme": "README.md"
+}

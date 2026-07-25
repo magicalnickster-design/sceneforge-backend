@@ -1,0 +1,130 @@
+/* LootForge — compact loot dialog styling */
+
+.lootforge-app .window-content {
+  background: linear-gradient(160deg, #2a2118 0%, #1a1510 55%, #12100d 100%);
+  color: #f0e6d4;
+}
+
+.lootforge-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.25rem 0.15rem 0.5rem;
+  font-family: "Signika", "Palatino Linotype", serif;
+}
+
+.lootforge-dialog__header h2 {
+  margin: 0;
+  font-size: 1.35rem;
+  letter-spacing: 0.02em;
+  color: #f7efe0;
+  border: none;
+}
+
+.lootforge-dialog__meta {
+  margin: 0.15rem 0 0;
+  opacity: 0.8;
+  font-size: 0.9rem;
+}
+
+.lootforge-dialog__stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.65rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(214, 178, 110, 0.25);
+}
+
+.lootforge-dialog__stats > div {
+  text-align: center;
+}
+
+.lootforge-dialog__stats dt {
+  margin: 0;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.7;
+}
+
+.lootforge-dialog__stats dd {
+  margin: 0.2rem 0 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.lootforge-tier--poor { color: #c4b8a4; }
+.lootforge-tier--common { color: #d8d8d8; }
+.lootforge-tier--good { color: #7dce7d; }
+.lootforge-tier--rare { color: #6eb6ff; }
+.lootforge-tier--best { color: #e2b14a; }
+
+.lootforge-dialog__bonus {
+  margin: 0;
+  padding: 0.4rem 0.55rem;
+  border-left: 3px solid #e2b14a;
+  background: rgba(226, 177, 74, 0.12);
+  font-size: 0.9rem;
+}
+
+.lootforge-dialog__items h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+  border: none;
+  color: #f0e6d4;
+}
+
+.lootforge-dialog__items ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.lootforge-dialog__items li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.4rem 0.55rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.lootforge-item-name {
+  font-weight: 600;
+}
+
+.lootforge-item-qty {
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+
+.lootforge-dialog__empty {
+  margin: 0;
+  opacity: 0.75;
+  font-style: italic;
+}
+
+/* Token HUD affordance */
+#token-hud .control-icon.lootforge-loot-body,
+#token-hud .control-icon.lootforge-reset-loot {
+  color: #f0e6d4;
+}
+
+#token-hud .control-icon.lootforge-loot-body:hover {
+  color: #e2b14a;
+}
+
+#token-hud .control-icon.lootforge-reset-loot:hover {
+  color: #ff8f70;
+}
+
+.lootforge-chat ul {
+  margin: 0.25rem 0 0.5rem 1.1rem;
+}

@@ -1,0 +1,50 @@
+{
+  "LOOTFORGE": {
+    "Title": "LootForge",
+    "LootBody": "Loot Body",
+    "ResetLoot": "Reset Loot Flag",
+    "Notify": {
+      "WrongSystem": "LootForge currently supports the D&D 5e system only.",
+      "NoToken": "Select or open the Token HUD on exactly one defeated creature.",
+      "NotDefeated": "{name} is not defeated.",
+      "AlreadyLooted": "{name} has already been looted.",
+      "NoPermission": "You do not have permission to loot {name}.",
+      "NoLooter": "No assigned character available to roll. Assign a character to your user, or select your character token.",
+      "RollCancelled": "Loot roll was cancelled.",
+      "NoTable": "No loot table is defined for {name}.",
+      "LootClaimed": "Claimed loot on {name}.",
+      "LootPosted": "Loot posted to chat. Drag items to a character sheet to claim them.",
+      "FlagReset": "Loot flag reset for {name}.",
+      "NeedGM": "Waiting for a GM to apply the looted flag…"
+    },
+    "Dialog": {
+      "Title": "Loot: {name}",
+      "Creature": "Creature",
+      "Skill": "Skill",
+      "RollTotal": "Roll Total",
+      "Natural": "Natural Die",
+      "Tier": "Loot Tier",
+      "Items": "Items Found",
+      "Quantity": "Qty",
+      "Claim": "Claim Loot",
+      "Close": "Close",
+      "Empty": "Nothing useful was recovered.",
+      "BonusNat20": "Natural 20 bonus applied."
+    },
+    "Tier": {
+      "poor": "Poor",
+      "common": "Common",
+      "good": "Good",
+      "rare": "Rare",
+      "best": "Best"
+    },
+    "Interaction": {
+      "search": "Search",
+      "harvest": "Harvest"
+    },
+    "Skill": {
+      "inv": "Investigation",
+      "sur": "Survival"
+    }
+  }
+}

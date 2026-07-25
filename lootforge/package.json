@@ -1,0 +1,10 @@
+{
+  "name": "lootforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Foundry VTT LootForge module (Gambits Forge prototype)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

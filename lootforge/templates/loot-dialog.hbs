@@ -1,0 +1,43 @@
+<div class="lootforge-dialog">
+  <header class="lootforge-dialog__header">
+    <h2>{{creatureName}}</h2>
+    <p class="lootforge-dialog__meta">
+      {{interactionLabel}} · {{skillLabel}}
+    </p>
+  </header>
+
+  <dl class="lootforge-dialog__stats">
+    <div>
+      <dt>{{localize "LOOTFORGE.Dialog.RollTotal"}}</dt>
+      <dd>{{rollTotal}}</dd>
+    </div>
+    <div>
+      <dt>{{localize "LOOTFORGE.Dialog.Natural"}}</dt>
+      <dd>{{naturalDie}}</dd>
+    </div>
+    <div>
+      <dt>{{localize "LOOTFORGE.Dialog.Tier"}}</dt>
+      <dd class="lootforge-tier lootforge-tier--{{tier}}">{{tierLabel}}</dd>
+    </div>
+  </dl>
+
+  {{#if natural20Bonus}}
+  <p class="lootforge-dialog__bonus">{{localize "LOOTFORGE.Dialog.BonusNat20"}}</p>
+  {{/if}}
+
+  <section class="lootforge-dialog__items">
+    <h3>{{localize "LOOTFORGE.Dialog.Items"}}</h3>
+    {{#if items.length}}
+    <ul>
+      {{#each items}}
+      <li>
+        <span class="lootforge-item-name">{{name}}</span>
+        <span class="lootforge-item-qty">×{{quantity}}</span>
+      </li>
+      {{/each}}
+    </ul>
+    {{else}}
+    <p class="lootforge-dialog__empty">{{localize "LOOTFORGE.Dialog.Empty"}}</p>
+    {{/if}}
+  </section>
+</div>
