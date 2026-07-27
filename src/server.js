@@ -82,6 +82,10 @@ const GAMBITS_JWT_ISSUER = process.env.GAMBITS_JWT_ISSUER || "";
 const GAMBITS_JWT_AUDIENCE = process.env.GAMBITS_JWT_AUDIENCE || "";
 const IDEMPOTENCY_DB_PATH =
   process.env.IDEMPOTENCY_DB_PATH || path.join(process.cwd(), "data", "idempotency.sqlite");
+const LOOTFORGE_PRODUCT_SLUG = "lootforge";
+const LOOTFORGE_MIN_TIER = Math.max(1, Number(process.env.LOOTFORGE_MIN_TIER || 1));
+const LOOTFORGE_ENTITLEMENT_DAYS = Math.max(1, Math.min(30, Number(process.env.LOOTFORGE_ENTITLEMENT_DAYS || 30)));
+const ENTITLEMENT_TOKEN_VERSION = String(process.env.ENTITLEMENT_TOKEN_VERSION || "v1");
 
 const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
@@ -425,10 +429,17 @@ function isImageLikeFieldName(key) {
   if (!normalized) {
     return false;
   }
+  if (normalized === "num_images") {
+    return false;
+  }
   if (BFL_IMAGE_INPUT_FIELD_NAMES.has(normalized)) {
     return true;
   }
-  return normalized.includes("image") || normalized.includes("mask");
+  return (
+    normalized.endsWith("_image") ||
+    normalized.startsWith("image_") ||
+    normalized === "mask"
+  );
 }
 
 function sanitizeProviderPayloadForTextToImage(payload) {
@@ -514,6 +525,145 @@ function normalizeGenerateError(error, message) {
   return { error, message };
 }
 
+function tierRankFromValue(rawTier) {
+  const normalized = String(rawTier ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return 0;
+  }
+  const numeric = Number(normalized);
+  if (Number.isFinite(numeric)) {
+    return Math.max(0, Math.floor(numeric));
+  }
+  const mapping = {
+    free: 0,
+    tier0: 0,
+    none: 0,
+    tier1: 1,
+    adventurer: 1,
+    "adventurer-tier": 1,
+    "adventurer_tier": 1,
+    tier2: 2,
+    "dungeon-master": 2,
+    dungeonmaster: 2,
+    dungeon_master: 2,
+    dm: 2,
+    tier3: 3,
+    founder: 3
+  };
+  return mapping[normalized] ?? 0;
+}
+
+function canonicalTierName(rank) {
+  if (rank >= 3) {
+    return "Founder";
+  }
+  if (rank >= 2) {
+    return "Dungeon Master";
+  }
+  if (rank >= 1) {
+    return "Adventurer";
+  }
+  return "Free";
+}
+
+function normalizeSubscriptionStatus(claims = {}) {
+  const candidates = [
+    claims.subscriptionStatus,
+    claims.subscription_status,
+    claims.subscription?.status,
+    claims.planStatus
+  ];
+  const firstString = candidates.find((value) => typeof value === "string" && value.trim());
+  if (firstString) {
+    return firstString.trim().toLowerCase();
+  }
+  if (claims.subscriptionActive === true || claims.subscription?.active === true) {
+    return "active";
+  }
+  if (claims.subscriptionActive === false || claims.subscription?.active === false) {
+    return "inactive";
+  }
+  return "unknown";
+}
+
+function detectAccountState(claims = {}) {
+  const status =
+    String(claims.accountStatus || claims.account_status || claims.userStatus || "")
+      .trim()
+      .toLowerCase() || "active";
+  if (claims.suspended === true || status === "suspended") {
+    return "suspended";
+  }
+  if (claims.revoked === true || status === "revoked") {
+    return "revoked";
+  }
+  return status;
+}
+
+function resolveLootforgeDenialReason({
+  subscriptionStatus,
+  tierRank,
+  accountState,
+  override,
+  claims
+}) {
+  if (accountState === "suspended") {
+    return "account_suspended";
+  }
+  if (accountState === "revoked" || override?.status === "revoked" || claims?.entitlementRevoked === true) {
+    return "entitlement_revoked";
+  }
+  if (subscriptionStatus === "active") {
+    if (tierRank < LOOTFORGE_MIN_TIER) {
+      return "tier_too_low";
+    }
+    return "";
+  }
+  if (["expired", "past_due", "canceled", "cancelled", "inactive"].includes(subscriptionStatus)) {
+    return "subscription_expired";
+  }
+  return "subscription_required";
+}
+
+function createLootforgeEntitlementToken({
+  userId,
+  tierRank,
+  expiresAt,
+  tokenVersion = ENTITLEMENT_TOKEN_VERSION
+}) {
+  const issuedAtMs = Date.now();
+  const expiresAtMs = new Date(expiresAt).getTime();
+  const payload = {
+    sub: userId,
+    userId,
+    product: LOOTFORGE_PRODUCT_SLUG,
+    tier: tierRank,
+    issuedAt: new Date(issuedAtMs).toISOString(),
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    tokenVersion,
+    jti: crypto.randomUUID()
+  };
+  const maxAgeSeconds = Math.max(1, Math.floor((expiresAtMs - issuedAtMs) / 1000));
+  return jwt.sign(payload, SESSION_SECRET, {
+    algorithm: GAMBITS_JWT_ALGORITHMS[0] || "HS256",
+    expiresIn: maxAgeSeconds
+  });
+}
+
+function verifyLootforgeEntitlementToken(token) {
+  try {
+    const payload = jwt.verify(String(token || ""), SESSION_SECRET, {
+      algorithms: GAMBITS_JWT_ALGORITHMS
+    });
+    if (payload?.product !== LOOTFORGE_PRODUCT_SLUG) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 function isUuidV4(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     String(value || "").trim()
@@ -551,7 +701,7 @@ function requireGambitsJwt(req, res, next) {
         .status(403)
         .json(normalizeGenerateError("EMAIL_NOT_VERIFIED", "Verified email is required."));
     }
-    req.gambitsAuth = { userId };
+    req.gambitsAuth = { userId, claims: payload };
     return next();
   } catch (error) {
     if (error?.name === "TokenExpiredError") {
@@ -1527,6 +1677,80 @@ app.get("/api/subscription/status", authorizeSubscriptionToken, async (req, res)
   });
 });
 
+app.get("/api/entitlements/lootforge", requireGambitsJwt, async (req, res) => {
+  const checkedAt = new Date().toISOString();
+  const claims = req.gambitsAuth.claims || {};
+  const userId = req.gambitsAuth.userId;
+  const subscriptionStatus = normalizeSubscriptionStatus(claims);
+  const accountState = detectAccountState(claims);
+  const tierRank = Math.max(
+    tierRankFromValue(claims.tier),
+    tierRankFromValue(claims.tierName),
+    tierRankFromValue(claims.plan),
+    tierRankFromValue(claims.subscriptionTier),
+    tierRankFromValue(claims.subscription?.plan)
+  );
+
+  const override = await tokenStore.getProductOverride(userId, LOOTFORGE_PRODUCT_SLUG);
+  if (override?.status === "granted") {
+    const grantedUntil =
+      override.expiresAt &&
+      new Date(override.expiresAt).getTime() > Date.now() &&
+      new Date(override.expiresAt).getTime() < Date.now() + LOOTFORGE_ENTITLEMENT_DAYS * 24 * 60 * 60 * 1000
+        ? override.expiresAt
+        : new Date(Date.now() + LOOTFORGE_ENTITLEMENT_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const entitlementToken = createLootforgeEntitlementToken({
+      userId,
+      tierRank: Math.max(tierRank, LOOTFORGE_MIN_TIER),
+      expiresAt: grantedUntil
+    });
+    return res.json({
+      product: LOOTFORGE_PRODUCT_SLUG,
+      entitled: true,
+      subscriptionStatus: subscriptionStatus === "unknown" ? "active" : subscriptionStatus,
+      tier: Math.max(tierRank, LOOTFORGE_MIN_TIER),
+      tierName: canonicalTierName(Math.max(tierRank, LOOTFORGE_MIN_TIER)),
+      expiresAt: grantedUntil,
+      checkedAt,
+      entitlementToken
+    });
+  }
+
+  const denialReason = resolveLootforgeDenialReason({
+    subscriptionStatus,
+    tierRank,
+    accountState,
+    override,
+    claims
+  });
+
+  if (denialReason) {
+    return res.status(403).json({
+      product: LOOTFORGE_PRODUCT_SLUG,
+      entitled: false,
+      reason: denialReason
+    });
+  }
+
+  const expiresAt = new Date(Date.now() + LOOTFORGE_ENTITLEMENT_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const entitlementToken = createLootforgeEntitlementToken({
+    userId,
+    tierRank,
+    expiresAt
+  });
+
+  return res.json({
+    product: LOOTFORGE_PRODUCT_SLUG,
+    entitled: true,
+    subscriptionStatus,
+    tier: tierRank,
+    tierName: canonicalTierName(tierRank),
+    expiresAt,
+    checkedAt,
+    entitlementToken
+  });
+});
+
 app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (req, res) => {
   if (!BFL_API_KEY) {
     return res
@@ -1974,4 +2198,8 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, start };
+module.exports = {
+  app,
+  start,
+  verifyLootforgeEntitlementToken
+};

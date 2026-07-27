@@ -86,3 +86,33 @@ test("token store reserves quota atomically", async () => {
   const afterRelease = await store.getMonthlyUsage("discord:123", month);
   assert.equal(afterRelease.generations, 0);
 });
+
+test("token store supports product overrides", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sf-overrides-"));
+  const dbPath = path.join(tempDir, "tokens.json");
+  const store = new TokenStore({ dbPath, tokenPepper: "pepper-test" });
+  await store.init();
+
+  const granted = await store.setProductOverride({
+    userId: "user-1",
+    product: "lootforge",
+    status: "granted",
+    reason: "manual-grant"
+  });
+  assert.equal(granted.status, "granted");
+
+  const readBack = await store.getProductOverride("user-1", "lootforge");
+  assert.ok(readBack);
+  assert.equal(readBack.status, "granted");
+
+  const list = await store.listProductOverridesForUser("user-1");
+  assert.equal(list.length, 1);
+
+  await store.setProductOverride({
+    userId: "user-1",
+    product: "lootforge",
+    status: "none"
+  });
+  const removed = await store.getProductOverride("user-1", "lootforge");
+  assert.equal(removed, null);
+});

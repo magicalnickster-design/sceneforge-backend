@@ -18,7 +18,7 @@ class TokenStore {
     try {
       await fs.access(this.dbPath);
     } catch {
-      await this._writeState({ version: 2, tokens: [], usageByMonth: {} });
+      await this._writeState({ version: 3, tokens: [], usageByMonth: {}, productOverrides: [] });
     }
   }
 
@@ -320,8 +320,95 @@ class TokenStore {
     });
   }
 
+  async setProductOverride({
+    userId,
+    product,
+    status,
+    reason = "",
+    expiresAt = null,
+    setBy = "system"
+  }) {
+    const now = this.clock();
+    return this._withLock(async () => {
+      const state = await this._readState();
+      state.productOverrides = Array.isArray(state.productOverrides) ? state.productOverrides : [];
+      const index = state.productOverrides.findIndex(
+        (entry) => entry.userId === userId && entry.product === product
+      );
+
+      if (status === "none") {
+        if (index >= 0) {
+          state.productOverrides.splice(index, 1);
+          await this._writeState(state);
+        }
+        return null;
+      }
+
+      const next = {
+        id: index >= 0 ? state.productOverrides[index].id : crypto.randomUUID(),
+        userId,
+        product,
+        status,
+        reason,
+        expiresAt,
+        setBy,
+        updatedAt: now,
+        createdAt: index >= 0 ? state.productOverrides[index].createdAt : now
+      };
+      if (index >= 0) {
+        state.productOverrides[index] = next;
+      } else {
+        state.productOverrides.push(next);
+      }
+      await this._writeState(state);
+      return next;
+    });
+  }
+
+  async getProductOverride(userId, product) {
+    return this._withLock(async () => {
+      const state = await this._readState();
+      state.productOverrides = Array.isArray(state.productOverrides) ? state.productOverrides : [];
+      const override = state.productOverrides.find(
+        (entry) => entry.userId === userId && entry.product === product
+      );
+      if (!override) {
+        return null;
+      }
+      if (override.expiresAt && new Date(override.expiresAt).getTime() <= Date.now()) {
+        state.productOverrides = state.productOverrides.filter((entry) => entry.id !== override.id);
+        await this._writeState(state);
+        return null;
+      }
+      return override;
+    });
+  }
+
+  async listProductOverridesForUser(userId) {
+    const state = await this._readState();
+    state.productOverrides = Array.isArray(state.productOverrides) ? state.productOverrides : [];
+    const now = Date.now();
+    return state.productOverrides.filter((entry) => {
+      if (entry.userId !== userId) {
+        return false;
+      }
+      if (!entry.expiresAt) {
+        return true;
+      }
+      return new Date(entry.expiresAt).getTime() > now;
+    });
+  }
+
   async _readState() {
-    const raw = await fs.readFile(this.dbPath, "utf8");
+    let raw;
+    try {
+      raw = await fs.readFile(this.dbPath, "utf8");
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        return { version: 3, tokens: [], usageByMonth: {}, productOverrides: [] };
+      }
+      throw error;
+    }
     const parsed = JSON.parse(raw);
     if (!parsed.tokens || !Array.isArray(parsed.tokens)) {
       return { version: 2, tokens: [], usageByMonth: {} };
@@ -329,7 +416,10 @@ class TokenStore {
     if (!parsed.usageByMonth || typeof parsed.usageByMonth !== "object") {
       parsed.usageByMonth = {};
     }
-    parsed.version = Number(parsed.version || 2);
+    if (!Array.isArray(parsed.productOverrides)) {
+      parsed.productOverrides = [];
+    }
+    parsed.version = Number(parsed.version || 3);
     return parsed;
   }
 

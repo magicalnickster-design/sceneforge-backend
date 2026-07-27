@@ -24,6 +24,11 @@ function loadApp() {
   return require("../src/server").app;
 }
 
+function loadServer() {
+  delete require.cache[require.resolve("../src/server")];
+  return require("../src/server");
+}
+
 function createToken(overrides = {}, options = {}) {
   const payload = {
     sub: "user-123",
@@ -877,4 +882,178 @@ test("malformed library upsert is non-blocking when strict contract disabled", a
   assert.equal(response.status, 200);
   assert.equal(response.body.ok, false);
   assert.equal(response.body.skipped, true);
+});
+
+test("active Tier 1 user receives LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 1, tierName: "Adventurer" });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.product, "lootforge");
+  assert.equal(response.body.entitled, true);
+  assert.equal(response.body.tier, 1);
+});
+
+test("active Tier 2 user receives LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 2, tierName: "Dungeon Master" });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.entitled, true);
+  assert.equal(response.body.tier, 2);
+});
+
+test("active Tier 3 user receives LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 3, tierName: "Founder" });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.entitled, true);
+  assert.equal(response.body.tier, 3);
+});
+
+test("free user is denied LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 0, tierName: "Free" });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.product, "lootforge");
+  assert.equal(response.body.reason, "tier_too_low");
+});
+
+test("expired subscriber is denied LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "expired", tier: 2 });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.reason, "subscription_expired");
+});
+
+test("suspended account is denied LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 2, accountStatus: "suspended" });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.reason, "account_suspended");
+});
+
+test("revoked entitlement claim is denied LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 2, entitlementRevoked: true });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 403);
+  assert.equal(response.body.reason, "entitlement_revoked");
+});
+
+test("zero SceneForge generations still allows LootForge access", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({
+    subscriptionStatus: "active",
+    tier: 1,
+    remainingGenerations: 0,
+    usage: { remaining: 0, used: 100, limit: 100 }
+  });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.entitled, true);
+});
+
+test("LootForge entitlement token lasts no longer than 30 days", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 2 });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 200);
+  const checkedAt = new Date(response.body.checkedAt).getTime();
+  const expiresAt = new Date(response.body.expiresAt).getTime();
+  const maxMs = 30 * 24 * 60 * 60 * 1000;
+  assert.ok(expiresAt - checkedAt <= maxMs + 1000);
+});
+
+test("LootForge refresh returns a new valid entitlement token", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 2 });
+  const first = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  const second = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.notEqual(first.body.entitlementToken, second.body.entitlementToken);
+});
+
+test("tampered LootForge entitlement token is rejected", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken({ subscriptionStatus: "active", tier: 2 });
+  const response = await request(app)
+    .get("/api/entitlements/lootforge")
+    .set("Authorization", `Bearer ${token}`);
+  assert.equal(response.status, 200);
+  const server = loadServer();
+  const valid = server.verifyLootforgeEntitlementToken(response.body.entitlementToken);
+  assert.ok(valid);
+  const tampered = `${response.body.entitlementToken.slice(0, -2)}zz`;
+  const invalid = server.verifyLootforgeEntitlementToken(tampered);
+  assert.equal(invalid, null);
+});
+
+test("LootForge entitlement checks do not decrement SceneForge usage", async () => {
+  setupEnv();
+  const tokenStoreModule = require("../src/lib/tokenStore");
+  const originalIncrement = tokenStoreModule.TokenStore.prototype.incrementMonthlyUsage;
+  let usageIncrementCalls = 0;
+  tokenStoreModule.TokenStore.prototype.incrementMonthlyUsage = async function wrappedIncrement(...args) {
+    usageIncrementCalls += 1;
+    return originalIncrement.apply(this, args);
+  };
+  try {
+    const app = loadApp();
+    const token = createToken({ subscriptionStatus: "active", tier: 2 });
+    const response = await request(app)
+      .get("/api/entitlements/lootforge")
+      .set("Authorization", `Bearer ${token}`);
+    assert.equal(response.status, 200);
+    assert.equal(response.body.entitled, true);
+    assert.equal(usageIncrementCalls, 0);
+  } finally {
+    tokenStoreModule.TokenStore.prototype.incrementMonthlyUsage = originalIncrement;
+  }
+});
+
+test("unauthenticated LootForge request returns auth error", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app).get("/api/entitlements/lootforge");
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "AUTH_REQUIRED");
 });
