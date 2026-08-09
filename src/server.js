@@ -663,6 +663,15 @@ function isUuidV4(value) {
   );
 }
 
+function isLegacySfIdempotencyKey(value) {
+  const normalized = String(value || "").trim();
+  return /^sf-\d{10,16}-[a-f0-9]{6,64}$/i.test(normalized);
+}
+
+function isValidIdempotencyKey(value) {
+  return isUuidV4(value) || isLegacySfIdempotencyKey(value);
+}
+
 function requireGambitsJwt(req, res, next) {
   if (!SESSION_SECRET) {
     return res
@@ -708,13 +717,13 @@ function requireGambitsJwt(req, res, next) {
 
 function requireIdempotencyKey(req, res, next) {
   const idempotencyKey = String(req.headers["idempotency-key"] || "").trim();
-  if (!isUuidV4(idempotencyKey)) {
+  if (!isValidIdempotencyKey(idempotencyKey)) {
     return res
       .status(400)
       .json(
         normalizeGenerateError(
           "INVALID_IDEMPOTENCY_KEY",
-          "A valid UUID Idempotency-Key header is required."
+          "A valid Idempotency-Key header is required."
         )
       );
   }

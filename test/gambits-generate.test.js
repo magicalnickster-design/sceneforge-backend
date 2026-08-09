@@ -145,6 +145,21 @@ test("invalid idempotency key", async () => {
   assert.equal(response.body.error, "INVALID_IDEMPOTENCY_KEY");
 });
 
+test("legacy sf idempotency key remains accepted for compatibility", async () => {
+  setupEnv();
+  setFetchSuccess();
+  const app = loadApp();
+  const token = createToken();
+  const legacyKey = "sf-1723084800000-1a2b3c4d5e";
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", legacyKey)
+    .send({ prompt: "forest map" });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.success, true);
+});
+
 test("duplicate in-progress request returns GENERATION_IN_PROGRESS", async () => {
   setupEnv();
   const idempotencyKey = crypto.randomUUID();
