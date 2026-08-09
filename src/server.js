@@ -142,14 +142,7 @@ function isAllowedCorsOrigin(origin) {
   }
   try {
     const parsed = new URL(origin);
-    const hostname = String(parsed.hostname || "").toLowerCase();
-    if (
-      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
-      ["localhost", "127.0.0.1", "::1"].includes(hostname)
-    ) {
-      return true;
-    }
-    if (parsed.protocol === "https:") {
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
       return true;
     }
   } catch {

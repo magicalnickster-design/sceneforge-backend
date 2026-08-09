@@ -647,6 +647,35 @@ test("Forge-style CORS preflight works for cache route", async () => {
   assert.match(response.headers["access-control-allow-methods"], /POST/);
 });
 
+test("HTTP IP origin preflight is allowed", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app)
+    .options("/api/maps/generate")
+    .set("Origin", "http://173.28.194.119:30001")
+    .set("Access-Control-Request-Method", "POST")
+    .set("Access-Control-Request-Headers", "authorization,content-type,idempotency-key");
+
+  assert.equal(response.status, 204);
+  assert.equal(response.headers["access-control-allow-origin"], "http://173.28.194.119:30001");
+  assert.match(response.headers["access-control-allow-headers"], /authorization/i);
+  assert.match(response.headers["access-control-allow-headers"], /content-type/i);
+  assert.match(response.headers["access-control-allow-headers"], /idempotency-key/i);
+});
+
+test("arbitrary HTTPS origin preflight is allowed", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app)
+    .options("/api/maps/generate")
+    .set("Origin", "https://customer.example-foundry.net:4443")
+    .set("Access-Control-Request-Method", "POST")
+    .set("Access-Control-Request-Headers", "authorization,content-type,idempotency-key");
+
+  assert.equal(response.status, 204);
+  assert.equal(response.headers["access-control-allow-origin"], "https://customer.example-foundry.net:4443");
+});
+
 test("Forge-hosted authenticated POST includes CORS headers", async () => {
   setupEnv();
   const app = loadApp();
@@ -712,6 +741,20 @@ test("unauthorized request still includes CORS headers", async () => {
     response.headers["access-control-allow-origin"],
     "https://ytgambit-monday-night-dnd.forge-vtt.com"
   );
+});
+
+test("HTTP IP unauthorized request still includes CORS headers", async () => {
+  setupEnv();
+  const app = loadApp();
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Origin", "http://173.28.194.119:30001")
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({ prompt: "no auth map" });
+
+  assert.equal(response.status, 401);
+  assert.equal(response.body.error, "AUTH_REQUIRED");
+  assert.equal(response.headers["access-control-allow-origin"], "http://173.28.194.119:30001");
 });
 
 test("image proxy requires Gambits bearer token", async () => {
