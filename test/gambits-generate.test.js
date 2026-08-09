@@ -157,7 +157,7 @@ test("legacy sf idempotency key remains accepted for compatibility", async () =>
     .set("Idempotency-Key", legacyKey)
     .send({ prompt: "forest map" });
   assert.equal(response.status, 200);
-  assert.equal(response.body.success, true);
+  assert.equal(response.body.imagePath, "https://delivery.us3.bfl.ai/result.png");
 });
 
 test("duplicate in-progress request returns GENERATION_IN_PROGRESS", async () => {
