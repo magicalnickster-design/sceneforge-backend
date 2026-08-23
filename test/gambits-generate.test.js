@@ -6,6 +6,8 @@ const crypto = require("node:crypto");
 const jwt = require("jsonwebtoken");
 const request = require("supertest");
 const Database = require("better-sqlite3");
+const ONE_PIXEL_PNG_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z2ioAAAAASUVORK5CYII=";
 
 function setupEnv() {
   process.env.BFL_API_KEY = "test-bfl-key";
@@ -158,6 +160,87 @@ test("legacy sf idempotency key remains accepted for compatibility", async () =>
     .send({ prompt: "forest map" });
   assert.equal(response.status, 200);
   assert.equal(response.body.imagePath, "https://delivery.us3.bfl.ai/result.png");
+});
+
+test("edit mode request includes input_image and uses provider edit path", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const providerBodies = [];
+  global.fetch = async (url, options = {}) => {
+    if (String(url).includes("flux-2-flex")) {
+      providerBodies.push({
+        url: String(url),
+        body: JSON.parse(options.body || "{}")
+      });
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_edit_123", polling_url: "https://polling.example/edit-result" }),
+        headers: {
+          get: () => null
+        }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_edit_123",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/edit.png",
+        width: 1024,
+        height: 1024
+      }),
+      headers: {
+        get: () => null
+      }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({
+      prompt: "Keep the map layout and add a fountain",
+      width: 1024,
+      height: 1024,
+      orientation: "square",
+      input_image: ONE_PIXEL_PNG_DATA_URL
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.imagePath, "https://delivery.us3.bfl.ai/edit.png");
+  assert.equal(providerBodies.length, 1);
+  assert.equal(providerBodies[0].url, "https://api.bfl.ai/v1/flux-2-flex");
+  assert.equal(providerBodies[0].body.prompt.includes("fountain"), true);
+  assert.equal(typeof providerBodies[0].body.input_image, "string");
+  assert.equal(providerBodies[0].body.input_image.startsWith("data:image/png;base64,"), true);
+});
+
+test("invalid edit input_image fails clearly and does not call text-to-image provider", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  let providerCallCount = 0;
+  global.fetch = async () => {
+    providerCallCount += 1;
+    throw new Error("provider should not be called for invalid input_image");
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({
+      prompt: "Edit this map",
+      input_image: "data:image/png;base64,%%%not-valid-base64%%%"
+    });
+
+  assert.equal(response.status, 422);
+  assert.equal(response.body.error, "generation_failed");
+  assert.equal(response.body.reason, "invalid_input_image");
+  assert.match(String(response.body.detail || ""), /input_image/i);
+  assert.equal(providerCallCount, 0);
 });
 
 test("duplicate in-progress request returns GENERATION_IN_PROGRESS", async () => {

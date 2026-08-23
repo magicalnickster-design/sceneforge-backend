@@ -91,6 +91,8 @@ const BFL_GENERATE_ENDPOINT = "https://api.bfl.ai/v1/flux-2-flex";
 const BFL_RESULT_ENDPOINT = "https://api.bfl.ai/v1/get_result";
 const PROVIDER_NAME = "black-forest-labs";
 const MODEL_NAME = "flux-2-flex";
+const BFL_EDIT_ENDPOINT = process.env.BFL_EDIT_ENDPOINT || BFL_GENERATE_ENDPOINT;
+const GENERATE_REQUEST_BODY_LIMIT = process.env.GENERATE_REQUEST_BODY_LIMIT || "25mb";
 const PROVIDER_MAX_ATTEMPTS = 2;
 const PROVIDER_RETRY_BASE_MS = Math.max(100, Number(process.env.PROVIDER_RETRY_BASE_MS || 500));
 const PROVIDER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROVIDER_TIMEOUT_MS || 45000));
@@ -115,6 +117,10 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set([
   "image/webp",
   "image/gif"
 ]);
+const MAX_EDIT_INPUT_IMAGE_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.MAX_EDIT_INPUT_IMAGE_BYTES || 20 * 1024 * 1024)
+);
 
 const mapLibrary = new Map();
 const rateLimitBuckets = new Map();
@@ -175,7 +181,7 @@ app.use((req, res, next) => {
   }
   return next();
 });
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: GENERATE_REQUEST_BODY_LIMIT }));
 
 const authorizeSubscriptionToken = createSubscriptionAuthorizer({
   ownerAccessToken: OWNER_ACCESS_TOKEN,
@@ -451,13 +457,85 @@ function sanitizeProviderPayloadForTextToImage(payload) {
   };
 }
 
+function parseAndValidateInputImageDataUrl(rawInputImage) {
+  const value = String(rawInputImage || "").trim();
+  if (!value) {
+    throw createGenerationError("invalid_input_image", "input_image is required for edit mode.", {
+      status: 400
+    });
+  }
+
+  const dataUrlMatch = value.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!dataUrlMatch) {
+    throw createGenerationError(
+      "invalid_input_image",
+      "input_image must be a valid data:image/...;base64,... string.",
+      { status: 422 }
+    );
+  }
+
+  const mimeType = String(dataUrlMatch[1] || "").trim().toLowerCase();
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(mimeType)) {
+    throw createGenerationError(
+      "invalid_input_image",
+      `input_image content type '${mimeType}' is not supported.`,
+      { status: 415 }
+    );
+  }
+
+  const base64Data = String(dataUrlMatch[2] || "").replace(/\s+/g, "");
+  if (!base64Data || base64Data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Data)) {
+    throw createGenerationError("invalid_input_image", "input_image base64 payload is invalid.", {
+      status: 422
+    });
+  }
+
+  let buffer;
+  try {
+    buffer = Buffer.from(base64Data, "base64");
+  } catch {
+    throw createGenerationError("invalid_input_image", "input_image could not be decoded.", {
+      status: 422
+    });
+  }
+  if (!buffer || buffer.length === 0) {
+    throw createGenerationError("invalid_input_image", "input_image decoded to an empty payload.", {
+      status: 422
+    });
+  }
+  if (buffer.length > MAX_EDIT_INPUT_IMAGE_BYTES) {
+    throw createGenerationError(
+      "invalid_input_image",
+      `input_image exceeds max size of ${MAX_EDIT_INPUT_IMAGE_BYTES} bytes.`,
+      { status: 413 }
+    );
+  }
+
+  const dimensions = parseImageDimensionsFromBuffer(buffer);
+  if (!dimensions) {
+    throw createGenerationError(
+      "invalid_input_image",
+      "input_image is corrupt or unsupported. Supported formats: PNG, JPEG, WEBP, GIF.",
+      { status: 422 }
+    );
+  }
+
+  return {
+    dataUrl: `data:${mimeType};base64,${base64Data}`,
+    mimeType,
+    bytes: buffer.length,
+    dimensions
+  };
+}
+
 function logProviderRequestSchema({
   endpoint,
   method,
   model,
   payload,
   orientation,
-  attempt
+  attempt,
+  mode
 }) {
   const keys = Object.keys(payload || {});
   const imageFieldNames = keys.filter((key) => isImageLikeFieldName(key));
@@ -467,6 +545,7 @@ function logProviderRequestSchema({
       endpoint,
       method,
       model,
+      mode: mode || "text-to-image",
       attempt,
       topLevelFieldNames: keys,
       hasImageField: imageFieldNames.length > 0,
@@ -1280,7 +1359,11 @@ function selectImageUrl(resultPayload) {
   return candidates.find((candidate) => typeof candidate === "string" && candidate.length > 0) || null;
 }
 
-async function pollBflResult(initialPayload, generationId = null) {
+async function pollBflResult(
+  initialPayload,
+  generationId = null,
+  submissionEndpoint = BFL_GENERATE_ENDPOINT
+) {
   if (initialPayload && selectImageUrl(initialPayload)) {
     return initialPayload;
   }
@@ -1296,7 +1379,7 @@ async function pollBflResult(initialPayload, generationId = null) {
       "BFL response did not include polling_url or id.",
       {
         generationId,
-        endpoint: BFL_GENERATE_ENDPOINT,
+        endpoint: submissionEndpoint,
         upstream: initialPayload
       }
     );
@@ -1381,8 +1464,11 @@ async function runProviderGenerationWithRetries({
   idempotencyKey,
   requestedOrientation,
   requestedDimensions,
-  basePayload
+  basePayload,
+  mode = "text-to-image"
 }) {
+  const generationMode = mode === "image-edit" ? "image-edit" : "text-to-image";
+  const providerEndpoint = generationMode === "image-edit" ? BFL_EDIT_ENDPOINT : BFL_GENERATE_ENDPOINT;
   let payload = { ...basePayload };
   let lastError = null;
   const startedAt = Date.now();
@@ -1392,27 +1478,30 @@ async function runProviderGenerationWithRetries({
     attemptsRan = attempt;
     const attemptStartedAt = Date.now();
     try {
-      const sanitized = sanitizeProviderPayloadForTextToImage(payload);
-      payload = sanitized.payload;
-      if (sanitized.removedImageFields.length > 0) {
-        console.warn(
-          JSON.stringify({
-            event: "maps_generate_removed_image_fields",
-            removedImageFieldNames: sanitized.removedImageFields,
-            attempt,
-            endpoint: BFL_GENERATE_ENDPOINT
-          })
-        );
+      if (generationMode === "text-to-image") {
+        const sanitized = sanitizeProviderPayloadForTextToImage(payload);
+        payload = sanitized.payload;
+        if (sanitized.removedImageFields.length > 0) {
+          console.warn(
+            JSON.stringify({
+              event: "maps_generate_removed_image_fields",
+              removedImageFieldNames: sanitized.removedImageFields,
+              attempt,
+              endpoint: providerEndpoint
+            })
+          );
+        }
       }
       logProviderRequestSchema({
-        endpoint: BFL_GENERATE_ENDPOINT,
+        endpoint: providerEndpoint,
         method: "POST",
         model: MODEL_NAME,
         payload,
         orientation: requestedOrientation,
-        attempt
+        attempt,
+        mode: generationMode
       });
-      const initialResponse = await fetchJson(BFL_GENERATE_ENDPOINT, {
+      const initialResponse = await fetchJson(providerEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1423,7 +1512,7 @@ async function runProviderGenerationWithRetries({
         timeoutMs: PROVIDER_TIMEOUT_MS
       });
       const generationId = extractGenerationId(initialResponse);
-      const result = await pollBflResult(initialResponse, generationId);
+      const result = await pollBflResult(initialResponse, generationId, providerEndpoint);
       const imageUrl = selectImageUrl(result);
       if (!imageUrl) {
         throw createGenerationError("provider_response_invalid", "No image URL returned by BFL.", {
@@ -1501,7 +1590,7 @@ async function runProviderGenerationWithRetries({
           providerStatus: Number(error?.upstreamStatus || error?.status || 0) || null,
           reason: error?.reason || classifyGenerationReason(error),
           detail: error?.detail || error?.message || "Provider request failed.",
-          endpoint: error?.endpoint || BFL_GENERATE_ENDPOINT,
+          endpoint: error?.endpoint || providerEndpoint,
           elapsedMs: Date.now() - attemptStartedAt
         })
       );
@@ -1534,7 +1623,7 @@ async function runProviderGenerationWithRetries({
     createGenerationError("provider_retry_exhausted", "Provider retries were exhausted.", {
       status: 502,
       upstreamStatus: 502,
-      endpoint: BFL_GENERATE_ENDPOINT
+      endpoint: providerEndpoint
     });
   finalError.finalCode = finalError?.reason || "provider_retry_exhausted";
   finalError.attemptsRan = attemptsRan || PROVIDER_MAX_ATTEMPTS;
@@ -1763,6 +1852,8 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   const prompt = String(req.body?.prompt || "").trim();
   const imageCount = Math.max(1, Number(req.body?.imageCount || DEFAULT_IMAGE_COUNT));
   const requestedOrientation = normalizeOrientation(req.body?.imageOrientation || req.body?.orientation);
+  const rawInputImage = typeof req.body?.input_image === "string" ? req.body.input_image : "";
+  const isEditMode = rawInputImage.trim().length > 0;
   const requestedDimensions = normalizeDimensions({
     width: req.body?.width,
     height: req.body?.height,
@@ -1791,6 +1882,40 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
     return res.status(400).json(normalizeGenerateError("GENERATION_FAILED", "Field 'prompt' is required."));
   }
 
+  let validatedInputImage = null;
+  if (isEditMode) {
+    try {
+      validatedInputImage = parseAndValidateInputImageDataUrl(rawInputImage);
+      console.info(
+        JSON.stringify({
+          event: "maps_generate_mode",
+          mode: "image-edit",
+          hasInputImage: true,
+          provider: PROVIDER_NAME,
+          model: MODEL_NAME,
+          endpoint: BFL_EDIT_ENDPOINT,
+          inputImageMimeType: validatedInputImage.mimeType,
+          inputImageBytes: validatedInputImage.bytes,
+          inputImageDimensions: validatedInputImage.dimensions
+        })
+      );
+    } catch (error) {
+      const failure = buildGenerationFailure(error);
+      return res.status(failure.statusCode).json(failure.payload);
+    }
+  } else {
+    console.info(
+      JSON.stringify({
+        event: "maps_generate_mode",
+        mode: "text-to-image",
+        hasInputImage: false,
+        provider: PROVIDER_NAME,
+        model: MODEL_NAME,
+        endpoint: BFL_GENERATE_ENDPOINT
+      })
+    );
+  }
+
   const payload = {
     prompt: applyOrientationPrompt(prompt, requestedOrientation, false),
     width: requestedDimensions.width,
@@ -1800,6 +1925,9 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
     output_format: req.body?.output_format || "png",
     seed: normalizedSeed
   };
+  if (isEditMode && validatedInputImage) {
+    payload.input_image = validatedInputImage.dataUrl;
+  }
 
   Object.keys(payload).forEach((key) => {
     if (payload[key] === undefined || payload[key] === null || Number.isNaN(payload[key])) {
@@ -1854,18 +1982,20 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
         width: requestedDimensions.width,
         height: requestedDimensions.height
       },
-      basePayload: payload
+      basePayload: payload,
+      mode: isEditMode ? "image-edit" : "text-to-image"
     });
     const imageUrl = providerResult.imageUrl;
     const finalGenerationId = providerResult.generationId;
     const providerPayload = providerResult.result || {};
+    const providerEndpointUsed = isEditMode ? BFL_EDIT_ENDPOINT : BFL_GENERATE_ENDPOINT;
     const responsePayload = {
       imagePath: imageUrl,
       image_url: imageUrl,
       url: imageUrl,
       provider: PROVIDER_NAME,
       model: MODEL_NAME,
-      endpoint: BFL_GENERATE_ENDPOINT,
+      endpoint: providerEndpointUsed,
       estimatedCost:
         Number(
           providerPayload?.cost ??
@@ -1877,7 +2007,7 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
       metadata: {
         provider: PROVIDER_NAME,
         model: MODEL_NAME,
-        endpoint: BFL_GENERATE_ENDPOINT,
+        endpoint: providerEndpointUsed,
         estimatedCost:
           Number(
             providerPayload?.cost ??
@@ -2176,6 +2306,18 @@ app.post("/api/maps/library/vote", (req, res) => {
 });
 
 app.use((err, _req, res, _next) => {
+  if (err?.type === "entity.too.large" || err?.status === 413) {
+    return res.status(413).json({
+      error: "payload_too_large",
+      message: `Request body exceeds limit of ${GENERATE_REQUEST_BODY_LIMIT}.`
+    });
+  }
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({
+      error: "invalid_json",
+      message: "Request body is not valid JSON."
+    });
+  }
   res.status(500).json({
     error: "internal_server_error",
     message: err.message || "Unexpected error."
