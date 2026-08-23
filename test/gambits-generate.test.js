@@ -9,6 +9,7 @@ const Database = require("better-sqlite3");
 const ONE_PIXEL_PNG_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z2ioAAAAASUVORK5CYII=";
 const ONE_PIXEL_PNG_BASE64 = ONE_PIXEL_PNG_DATA_URL.split(",")[1];
+const ONE_PIXEL_PNG_BUFFER = Buffer.from(ONE_PIXEL_PNG_BASE64, "base64");
 
 function setupEnv() {
   process.env.BFL_API_KEY = "test-bfl-key";
@@ -20,6 +21,7 @@ function setupEnv() {
     os.tmpdir(),
     `sceneforge-idem-${crypto.randomUUID()}.sqlite`
   );
+  process.env.TAVERN_REFERENCE_IMAGE_URL = "";
 }
 
 function loadApp() {
@@ -243,6 +245,143 @@ test("invalid edit input_image fails clearly and does not call text-to-image pro
   assert.equal(response.body.reason, "invalid_input_image");
   assert.match(String(response.body.detail || ""), /input_image/i);
   assert.equal(providerCallCount, 0);
+});
+
+test("reference-guided request fetches reference image and includes it in provider payload", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const referenceUrl = "https://assets.example/tavern.png";
+  const providerBodies = [];
+  global.fetch = async (url, options = {}) => {
+    if (String(url) === referenceUrl) {
+      return {
+        ok: true,
+        headers: {
+          get: (key) => {
+            const normalized = String(key || "").toLowerCase();
+            if (normalized === "content-type") return "image/png";
+            if (normalized === "content-length") return String(ONE_PIXEL_PNG_BUFFER.length);
+            return null;
+          }
+        },
+        arrayBuffer: async () => ONE_PIXEL_PNG_BUFFER
+      };
+    }
+    if (String(url).includes("flux-2-flex")) {
+      providerBodies.push(JSON.parse(options.body || "{}"));
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_ref_123", polling_url: "https://polling.example/reference-result" }),
+        headers: {
+          get: () => null
+        }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_ref_123",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/reference.png",
+        width: 1024,
+        height: 1024
+      }),
+      headers: {
+        get: () => null
+      }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({
+      prompt: "Create a tavern map inspired by this reference image.",
+      reference_category: "tavern",
+      reference_image_url: referenceUrl
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(providerBodies.length, 1);
+  assert.equal(providerBodies[0].prompt.includes("tavern"), true);
+  assert.equal(providerBodies[0].input_image, ONE_PIXEL_PNG_BASE64);
+});
+
+test("text-to-image generation remains unchanged when no reference image is provided", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const providerBodies = [];
+  global.fetch = async (url, options = {}) => {
+    if (String(url).includes("flux-2-flex")) {
+      providerBodies.push(JSON.parse(options.body || "{}"));
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_text_123", polling_url: "https://polling.example/text-result" }),
+        headers: {
+          get: () => null
+        }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_text_123",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/text.png",
+        width: 1024,
+        height: 1024
+      }),
+      headers: {
+        get: () => null
+      }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({
+      prompt: "A moonlit forest encounter map."
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(providerBodies.length, 1);
+  assert.equal(Object.prototype.hasOwnProperty.call(providerBodies[0], "input_image"), false);
+});
+
+test("tavern reference endpoint serves curated image with cache headers", async () => {
+  setupEnv();
+  const referenceUrl = "https://assets.example/tavern-curated.png";
+  process.env.TAVERN_REFERENCE_IMAGE_URL = referenceUrl;
+  const app = loadApp();
+  global.fetch = async (url) => {
+    if (String(url) !== referenceUrl) {
+      throw new Error(`unexpected reference fetch URL: ${String(url)}`);
+    }
+    return {
+      ok: true,
+      headers: {
+        get: (key) => {
+          const normalized = String(key || "").toLowerCase();
+          if (normalized === "content-type") return "image/png";
+          if (normalized === "content-length") return String(ONE_PIXEL_PNG_BUFFER.length);
+          return null;
+        }
+      },
+      arrayBuffer: async () => ONE_PIXEL_PNG_BUFFER
+    };
+  };
+
+  const response = await request(app).get("/api/maps/references/tavern");
+  assert.equal(response.status, 200);
+  assert.equal(response.headers["content-type"], "image/png");
+  assert.match(String(response.headers["cache-control"] || ""), /max-age=/);
+  assert.equal(Number(response.headers["content-length"]), ONE_PIXEL_PNG_BUFFER.length);
+  assert.equal(typeof response.headers.etag, "string");
 });
 
 test("duplicate in-progress request returns GENERATION_IN_PROGRESS", async () => {

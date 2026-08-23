@@ -93,6 +93,11 @@ const PROVIDER_NAME = "black-forest-labs";
 const MODEL_NAME = "flux-2-flex";
 const BFL_EDIT_ENDPOINT = process.env.BFL_EDIT_ENDPOINT || BFL_GENERATE_ENDPOINT;
 const GENERATE_REQUEST_BODY_LIMIT = process.env.GENERATE_REQUEST_BODY_LIMIT || "25mb";
+const TAVERN_REFERENCE_IMAGE_URL = process.env.TAVERN_REFERENCE_IMAGE_URL || "";
+const REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS = Math.max(
+  60,
+  Number(process.env.REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS || 86400)
+);
 const PROVIDER_MAX_ATTEMPTS = 2;
 const PROVIDER_RETRY_BASE_MS = Math.max(100, Number(process.env.PROVIDER_RETRY_BASE_MS || 500));
 const PROVIDER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROVIDER_TIMEOUT_MS || 45000));
@@ -120,6 +125,10 @@ const ALLOWED_IMAGE_MIME_TYPES = new Set([
 const MAX_EDIT_INPUT_IMAGE_BYTES = Math.max(
   1024 * 1024,
   Number(process.env.MAX_EDIT_INPUT_IMAGE_BYTES || 20 * 1024 * 1024)
+);
+const MAX_REFERENCE_IMAGE_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.MAX_REFERENCE_IMAGE_BYTES || MAX_EDIT_INPUT_IMAGE_BYTES)
 );
 
 const mapLibrary = new Map();
@@ -1172,6 +1181,21 @@ function isAllowedImageUrl(rawUrl) {
   }
 }
 
+function isAllowedReferenceImageUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ""));
+    if (parsed.protocol === "https:") {
+      return true;
+    }
+    const isLocalHttp =
+      parsed.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.toLowerCase());
+    return isLocalHttp;
+  } catch {
+    return false;
+  }
+}
+
 function extensionFromContentType(contentType = "") {
   const normalized = String(contentType).toLowerCase();
   if (normalized.includes("png")) {
@@ -1256,6 +1280,111 @@ async function fetchImageAsBase64(imageUrl) {
     bytes: buffer.length,
     base64,
     dataUrl: `data:${normalizedContentType};base64,${base64}`
+  };
+}
+
+async function fetchReferenceImageForGeneration(referenceImageUrl) {
+  if (!isAllowedReferenceImageUrl(referenceImageUrl)) {
+    throw createGenerationError(
+      "invalid_reference_image_url",
+      "reference_image_url must be https (or localhost http for development).",
+      {
+        status: 400,
+        upstreamStatus: 400,
+        endpoint: referenceImageUrl
+      }
+    );
+  }
+
+  const response = await fetch(referenceImageUrl, {
+    method: "GET",
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+  });
+  if (!response.ok) {
+    throw createGenerationError(
+      "reference_image_fetch_failed",
+      `Reference image fetch failed with status ${response.status}.`,
+      {
+        status: response.status,
+        upstreamStatus: response.status,
+        endpoint: referenceImageUrl,
+        requestId:
+          response.headers.get("x-request-id") ||
+          response.headers.get("request-id") ||
+          response.headers.get("cf-ray") ||
+          null
+      }
+    );
+  }
+
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const normalizedContentType = contentType.split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_IMAGE_MIME_TYPES.has(normalizedContentType)) {
+    throw createGenerationError(
+      "invalid_reference_image_content_type",
+      "Reference image content type is not supported.",
+      {
+        status: 415,
+        upstreamStatus: 415,
+        endpoint: referenceImageUrl,
+        upstream: {
+          contentType
+        }
+      }
+    );
+  }
+
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_REFERENCE_IMAGE_BYTES) {
+    throw createGenerationError(
+      "reference_image_too_large",
+      `Reference image exceeds max size of ${MAX_REFERENCE_IMAGE_BYTES} bytes.`,
+      {
+        status: 413,
+        upstreamStatus: 413,
+        endpoint: referenceImageUrl
+      }
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (!buffer || buffer.length === 0) {
+    throw createGenerationError("invalid_reference_image", "Reference image payload was empty.", {
+      status: 422,
+      upstreamStatus: 422,
+      endpoint: referenceImageUrl
+    });
+  }
+  if (buffer.length > MAX_REFERENCE_IMAGE_BYTES) {
+    throw createGenerationError(
+      "reference_image_too_large",
+      `Reference image exceeds max size of ${MAX_REFERENCE_IMAGE_BYTES} bytes.`,
+      {
+        status: 413,
+        upstreamStatus: 413,
+        endpoint: referenceImageUrl
+      }
+    );
+  }
+  const dimensions = parseImageDimensionsFromBuffer(buffer);
+  if (!dimensions) {
+    throw createGenerationError(
+      "invalid_reference_image",
+      "Reference image is corrupt or unsupported.",
+      {
+        status: 422,
+        upstreamStatus: 422,
+        endpoint: referenceImageUrl
+      }
+    );
+  }
+
+  return {
+    contentType: normalizedContentType,
+    bytes: buffer.length,
+    base64: buffer.toString("base64"),
+    dimensions
   };
 }
 
@@ -1468,7 +1597,12 @@ async function runProviderGenerationWithRetries({
   basePayload,
   mode = "text-to-image"
 }) {
-  const generationMode = mode === "image-edit" ? "image-edit" : "text-to-image";
+  const generationMode =
+    mode === "image-edit"
+      ? "image-edit"
+      : mode === "reference-guided"
+        ? "reference-guided"
+        : "text-to-image";
   const providerEndpoint = generationMode === "image-edit" ? BFL_EDIT_ENDPOINT : BFL_GENERATE_ENDPOINT;
   let payload = { ...basePayload };
   let lastError = null;
@@ -1638,6 +1772,31 @@ app.get("/health", (_req, res) => {
     service: "sceneforge-backend",
     timestamp: new Date().toISOString()
   });
+});
+
+app.get("/api/maps/references/tavern", async (_req, res) => {
+  if (!TAVERN_REFERENCE_IMAGE_URL) {
+    return res.status(503).json({
+      error: "reference_image_unavailable",
+      message: "Tavern reference image is not configured."
+    });
+  }
+
+  try {
+    const referenceImage = await fetchReferenceImageForGeneration(TAVERN_REFERENCE_IMAGE_URL);
+    const imageBuffer = Buffer.from(referenceImage.base64, "base64");
+    const etag = `"${crypto.createHash("sha1").update(imageBuffer).digest("hex")}"`;
+    res.setHeader("Cache-Control", `public, max-age=${REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS}, s-maxage=${REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS}`);
+    res.setHeader("ETag", etag);
+    if (_req.headers["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+    res.setHeader("Content-Type", referenceImage.contentType);
+    return res.status(200).send(imageBuffer);
+  } catch (error) {
+    const failure = buildGenerationFailure(error);
+    return res.status(failure.statusCode).json(failure.payload);
+  }
 });
 
 app.get("/api/auth/discord/connect", (req, res) => {
@@ -1855,6 +2014,9 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   const requestedOrientation = normalizeOrientation(req.body?.imageOrientation || req.body?.orientation);
   const rawInputImage = typeof req.body?.input_image === "string" ? req.body.input_image : "";
   const isEditMode = rawInputImage.trim().length > 0;
+  const referenceImageUrl = String(req.body?.reference_image_url || "").trim();
+  const referenceCategory = String(req.body?.reference_category || "").trim().toLowerCase();
+  const isReferenceGuidedMode = !isEditMode && referenceImageUrl.length > 0;
   const requestedDimensions = normalizeDimensions({
     width: req.body?.width,
     height: req.body?.height,
@@ -1884,6 +2046,7 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   }
 
   let validatedInputImage = null;
+  let referenceImage = null;
   if (isEditMode) {
     try {
       validatedInputImage = parseAndValidateInputImageDataUrl(rawInputImage);
@@ -1895,9 +2058,32 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
           provider: PROVIDER_NAME,
           model: MODEL_NAME,
           endpoint: BFL_EDIT_ENDPOINT,
+          referenceCategory: referenceCategory || null,
+          hasReferenceImage: false,
           inputImageMimeType: validatedInputImage.mimeType,
           inputImageBytes: validatedInputImage.bytes,
           inputImageDimensions: validatedInputImage.dimensions
+        })
+      );
+    } catch (error) {
+      const failure = buildGenerationFailure(error);
+      return res.status(failure.statusCode).json(failure.payload);
+    }
+  } else if (isReferenceGuidedMode) {
+    try {
+      referenceImage = await fetchReferenceImageForGeneration(referenceImageUrl);
+      console.info(
+        JSON.stringify({
+          event: "maps_generate_mode",
+          mode: "reference-guided",
+          provider: PROVIDER_NAME,
+          model: MODEL_NAME,
+          endpoint: BFL_GENERATE_ENDPOINT,
+          referenceCategory: referenceCategory || null,
+          hasReferenceImage: true,
+          referenceImageContentType: referenceImage.contentType,
+          referenceImageBytes: referenceImage.bytes,
+          referenceImageDimensions: referenceImage.dimensions
         })
       );
     } catch (error) {
@@ -1910,6 +2096,8 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
         event: "maps_generate_mode",
         mode: "text-to-image",
         hasInputImage: false,
+        hasReferenceImage: false,
+        referenceCategory: referenceCategory || null,
         provider: PROVIDER_NAME,
         model: MODEL_NAME,
         endpoint: BFL_GENERATE_ENDPOINT
@@ -1928,6 +2116,8 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   };
   if (isEditMode && validatedInputImage) {
     payload.input_image = validatedInputImage.providerInputImage;
+  } else if (isReferenceGuidedMode && referenceImage) {
+    payload.input_image = referenceImage.base64;
   }
 
   Object.keys(payload).forEach((key) => {
@@ -1976,6 +2166,11 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   }
 
   try {
+    const generationMode = isEditMode
+      ? "image-edit"
+      : isReferenceGuidedMode
+        ? "reference-guided"
+        : "text-to-image";
     const providerResult = await runProviderGenerationWithRetries({
       idempotencyKey: req.idempotencyKey,
       requestedOrientation,
@@ -1984,12 +2179,12 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
         height: requestedDimensions.height
       },
       basePayload: payload,
-      mode: isEditMode ? "image-edit" : "text-to-image"
+      mode: generationMode
     });
     const imageUrl = providerResult.imageUrl;
     const finalGenerationId = providerResult.generationId;
     const providerPayload = providerResult.result || {};
-    const providerEndpointUsed = isEditMode ? BFL_EDIT_ENDPOINT : BFL_GENERATE_ENDPOINT;
+    const providerEndpointUsed = generationMode === "image-edit" ? BFL_EDIT_ENDPOINT : BFL_GENERATE_ENDPOINT;
     const responsePayload = {
       imagePath: imageUrl,
       image_url: imageUrl,
