@@ -2097,8 +2097,12 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   const requestedOrientation = normalizeOrientation(req.body?.imageOrientation || req.body?.orientation);
   const rawInputImage = typeof req.body?.input_image === "string" ? req.body.input_image : "";
   const isEditMode = rawInputImage.trim().length > 0;
-  const providedReferenceImageUrl = String(req.body?.reference_image_url || "").trim();
-  const referenceCategory = String(req.body?.reference_category || "").trim().toLowerCase();
+  const providedReferenceImageUrl = String(
+    req.body?.reference_image_url || req.body?.referenceImageUrl || req.body?.refrence_image_url || ""
+  ).trim();
+  const referenceCategory = String(
+    req.body?.reference_category || req.body?.referenceCategory || req.body?.refrence_category || ""
+  ).trim().toLowerCase();
   const shouldUseCuratedTavernReference =
     !isEditMode && referenceCategory === "tavern" && !providedReferenceImageUrl;
   const referenceImageUrl = shouldUseCuratedTavernReference

@@ -313,6 +313,67 @@ test("tavern reference category uses curated reference image and includes it in 
   assert.equal(providerBodies[0].input_image, ONE_PIXEL_PNG_BASE64);
 });
 
+test("reference-guided mode accepts camelCase reference fields", async () => {
+  setupEnv();
+  const app = loadApp();
+  const token = createToken();
+  const referenceUrl = "https://assets.example/tavern-camel.png";
+  const providerBodies = [];
+  global.fetch = async (url, options = {}) => {
+    if (String(url) === referenceUrl) {
+      return {
+        ok: true,
+        headers: {
+          get: (key) => {
+            const normalized = String(key || "").toLowerCase();
+            if (normalized === "content-type") return "image/png";
+            if (normalized === "content-length") return String(ONE_PIXEL_PNG_BUFFER.length);
+            return null;
+          }
+        },
+        arrayBuffer: async () => ONE_PIXEL_PNG_BUFFER
+      };
+    }
+    if (String(url).includes("flux-2-flex")) {
+      providerBodies.push(JSON.parse(options.body || "{}"));
+      return {
+        ok: true,
+        json: async () => ({ id: "gen_ref_camel", polling_url: "https://polling.example/reference-camel" }),
+        headers: {
+          get: () => null
+        }
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        id: "gen_ref_camel",
+        status: "complete",
+        image_url: "https://delivery.us3.bfl.ai/reference-camel.png",
+        width: 1024,
+        height: 1024
+      }),
+      headers: {
+        get: () => null
+      }
+    };
+  };
+
+  const response = await request(app)
+    .post("/api/maps/generate")
+    .set("Authorization", `Bearer ${token}`)
+    .set("Idempotency-Key", crypto.randomUUID())
+    .send({
+      prompt: "Generate tavern inspired map",
+      referenceCategory: "tavern",
+      referenceImageUrl: referenceUrl
+    });
+
+  assert.equal(response.status, 200);
+  assert.equal(providerBodies.length, 1);
+  assert.equal(providerBodies[0].input_image, ONE_PIXEL_PNG_BASE64);
+});
+
 test("text-to-image generation remains unchanged when no reference image is provided", async () => {
   setupEnv();
   const app = loadApp();
