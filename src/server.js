@@ -522,6 +522,7 @@ function parseAndValidateInputImageDataUrl(rawInputImage) {
 
   return {
     dataUrl: `data:${mimeType};base64,${base64Data}`,
+    providerInputImage: base64Data,
     mimeType,
     bytes: buffer.length,
     dimensions
@@ -1926,7 +1927,7 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
     seed: normalizedSeed
   };
   if (isEditMode && validatedInputImage) {
-    payload.input_image = validatedInputImage.dataUrl;
+    payload.input_image = validatedInputImage.providerInputImage;
   }
 
   Object.keys(payload).forEach((key) => {
