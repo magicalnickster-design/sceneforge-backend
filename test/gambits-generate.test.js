@@ -22,6 +22,10 @@ function setupEnv() {
     `sceneforge-idem-${crypto.randomUUID()}.sqlite`
   );
   process.env.TAVERN_REFERENCE_IMAGE_URL = "";
+  process.env.TAVERN_REFERENCE_IMAGE_PATH = path.join(
+    os.tmpdir(),
+    `sceneforge-tavern-${crypto.randomUUID()}.png`
+  );
 }
 
 function loadApp() {
@@ -247,11 +251,12 @@ test("invalid edit input_image fails clearly and does not call text-to-image pro
   assert.equal(providerCallCount, 0);
 });
 
-test("reference-guided request fetches reference image and includes it in provider payload", async () => {
+test("tavern reference category uses curated reference image and includes it in provider payload", async () => {
   setupEnv();
+  const referenceUrl = "https://assets.example/tavern.png";
+  process.env.TAVERN_REFERENCE_IMAGE_URL = referenceUrl;
   const app = loadApp();
   const token = createToken();
-  const referenceUrl = "https://assets.example/tavern.png";
   const providerBodies = [];
   global.fetch = async (url, options = {}) => {
     if (String(url) === referenceUrl) {
@@ -299,8 +304,7 @@ test("reference-guided request fetches reference image and includes it in provid
     .set("Idempotency-Key", crypto.randomUUID())
     .send({
       prompt: "Create a tavern map inspired by this reference image.",
-      reference_category: "tavern",
-      reference_image_url: referenceUrl
+      reference_category: "tavern"
     });
 
   assert.equal(response.status, 200);

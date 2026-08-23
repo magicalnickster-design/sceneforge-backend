@@ -1,6 +1,7 @@
 const express = require("express");
 const dotenv = require("dotenv");
 const path = require("path");
+const fs = require("fs/promises");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const { TokenStore } = require("./lib/tokenStore");
@@ -94,6 +95,8 @@ const MODEL_NAME = "flux-2-flex";
 const BFL_EDIT_ENDPOINT = process.env.BFL_EDIT_ENDPOINT || BFL_GENERATE_ENDPOINT;
 const GENERATE_REQUEST_BODY_LIMIT = process.env.GENERATE_REQUEST_BODY_LIMIT || "25mb";
 const TAVERN_REFERENCE_IMAGE_URL = process.env.TAVERN_REFERENCE_IMAGE_URL || "";
+const TAVERN_REFERENCE_IMAGE_PATH =
+  process.env.TAVERN_REFERENCE_IMAGE_PATH || path.join(process.cwd(), "data", "references", "tavern.png");
 const REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS = Math.max(
   60,
   Number(process.env.REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS || 86400)
@@ -1388,6 +1391,93 @@ async function fetchReferenceImageForGeneration(referenceImageUrl) {
   };
 }
 
+async function readLocalReferenceImageFile(filePath) {
+  try {
+    const buffer = await fs.readFile(filePath);
+    if (!buffer || buffer.length === 0) {
+      throw createGenerationError("invalid_reference_image", "Local reference image is empty.", {
+        status: 422,
+        endpoint: filePath
+      });
+    }
+    if (buffer.length > MAX_REFERENCE_IMAGE_BYTES) {
+      throw createGenerationError(
+        "reference_image_too_large",
+        `Reference image exceeds max size of ${MAX_REFERENCE_IMAGE_BYTES} bytes.`,
+        {
+          status: 413,
+          endpoint: filePath
+        }
+      );
+    }
+    const dimensions = parseImageDimensionsFromBuffer(buffer);
+    if (!dimensions) {
+      throw createGenerationError(
+        "invalid_reference_image",
+        "Local reference image is corrupt or unsupported.",
+        {
+          status: 422,
+          endpoint: filePath
+        }
+      );
+    }
+    const extension = path.extname(filePath).toLowerCase();
+    const contentType = extension === ".png"
+      ? "image/png"
+      : extension === ".jpg" || extension === ".jpeg"
+        ? "image/jpeg"
+        : extension === ".webp"
+          ? "image/webp"
+          : extension === ".gif"
+            ? "image/gif"
+            : "application/octet-stream";
+    return {
+      contentType,
+      bytes: buffer.length,
+      base64: buffer.toString("base64"),
+      dimensions,
+      buffer
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function persistReferenceImageFile(filePath, base64) {
+  const directory = path.dirname(filePath);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(filePath, Buffer.from(base64, "base64"));
+}
+
+async function resolveTavernReferenceImage() {
+  const localImage = await readLocalReferenceImageFile(TAVERN_REFERENCE_IMAGE_PATH);
+  if (localImage) {
+    return {
+      ...localImage,
+      source: "local-file"
+    };
+  }
+  if (!TAVERN_REFERENCE_IMAGE_URL) {
+    throw createGenerationError(
+      "reference_image_unavailable",
+      "Tavern reference image is not configured.",
+      {
+        status: 503
+      }
+    );
+  }
+  const remoteImage = await fetchReferenceImageForGeneration(TAVERN_REFERENCE_IMAGE_URL);
+  await persistReferenceImageFile(TAVERN_REFERENCE_IMAGE_PATH, remoteImage.base64);
+  return {
+    ...remoteImage,
+    buffer: Buffer.from(remoteImage.base64, "base64"),
+    source: "remote-url"
+  };
+}
+
 async function fetchImageDimensions(imageUrl) {
   if (!isAllowedImageUrl(imageUrl)) {
     throw createGenerationError(
@@ -1774,21 +1864,14 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.get("/api/maps/references/tavern", async (_req, res) => {
-  if (!TAVERN_REFERENCE_IMAGE_URL) {
-    return res.status(503).json({
-      error: "reference_image_unavailable",
-      message: "Tavern reference image is not configured."
-    });
-  }
-
+app.get("/api/maps/references/tavern", async (req, res) => {
   try {
-    const referenceImage = await fetchReferenceImageForGeneration(TAVERN_REFERENCE_IMAGE_URL);
-    const imageBuffer = Buffer.from(referenceImage.base64, "base64");
+    const referenceImage = await resolveTavernReferenceImage();
+    const imageBuffer = referenceImage.buffer || Buffer.from(referenceImage.base64, "base64");
     const etag = `"${crypto.createHash("sha1").update(imageBuffer).digest("hex")}"`;
     res.setHeader("Cache-Control", `public, max-age=${REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS}, s-maxage=${REFERENCE_IMAGE_CACHE_MAX_AGE_SECONDS}`);
     res.setHeader("ETag", etag);
-    if (_req.headers["if-none-match"] === etag) {
+    if (req.headers["if-none-match"] === etag) {
       return res.status(304).end();
     }
     res.setHeader("Content-Type", referenceImage.contentType);
@@ -2014,9 +2097,15 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
   const requestedOrientation = normalizeOrientation(req.body?.imageOrientation || req.body?.orientation);
   const rawInputImage = typeof req.body?.input_image === "string" ? req.body.input_image : "";
   const isEditMode = rawInputImage.trim().length > 0;
-  const referenceImageUrl = String(req.body?.reference_image_url || "").trim();
+  const providedReferenceImageUrl = String(req.body?.reference_image_url || "").trim();
   const referenceCategory = String(req.body?.reference_category || "").trim().toLowerCase();
-  const isReferenceGuidedMode = !isEditMode && referenceImageUrl.length > 0;
+  const shouldUseCuratedTavernReference =
+    !isEditMode && referenceCategory === "tavern" && !providedReferenceImageUrl;
+  const referenceImageUrl = shouldUseCuratedTavernReference
+    ? TAVERN_REFERENCE_IMAGE_URL
+    : providedReferenceImageUrl;
+  const isReferenceGuidedMode =
+    !isEditMode && (providedReferenceImageUrl.length > 0 || shouldUseCuratedTavernReference);
   const requestedDimensions = normalizeDimensions({
     width: req.body?.width,
     height: req.body?.height,
@@ -2071,7 +2160,9 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
     }
   } else if (isReferenceGuidedMode) {
     try {
-      referenceImage = await fetchReferenceImageForGeneration(referenceImageUrl);
+      referenceImage = shouldUseCuratedTavernReference
+        ? await resolveTavernReferenceImage()
+        : await fetchReferenceImageForGeneration(referenceImageUrl);
       console.info(
         JSON.stringify({
           event: "maps_generate_mode",
@@ -2081,6 +2172,8 @@ app.post("/api/maps/generate", requireGambitsJwt, requireIdempotencyKey, async (
           endpoint: BFL_GENERATE_ENDPOINT,
           referenceCategory: referenceCategory || null,
           hasReferenceImage: true,
+          referenceSource: shouldUseCuratedTavernReference ? "tavern-curated" : "request-url",
+          referenceImageUrlProvided: Boolean(providedReferenceImageUrl),
           referenceImageContentType: referenceImage.contentType,
           referenceImageBytes: referenceImage.bytes,
           referenceImageDimensions: referenceImage.dimensions
